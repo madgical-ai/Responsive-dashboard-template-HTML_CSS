@@ -1,0 +1,265 @@
+name: CI/CD
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  id-token: write
+env:
+  IMAGE_TAG: ${{ github.sha }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+jobs:
+  validate:
+    name: Validate (lint, type-check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Node
+      if: ${{ env.ACT != 'true' }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: npm
+    - name: Install dependencies
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        if [ -f package.json ]; then npm ci; fi
+    - name: Install eslint
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        if [ -f package.json ]; then npm install --no-save eslint; fi
+    - name: Lint
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        echo "No language-specific linter detected; running generic checks"
+        if [ -f package.json ]; then npx --no-install eslint .; fi
+    - name: Type check
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        echo "No language-specific type checker detected; skipping"
+  test:
+    name: Test (unit, integration, coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Node
+      if: ${{ env.ACT != 'true' }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: npm
+    - name: Install dependencies
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        if [ -f package.json ]; then npm ci; fi
+    - name: Run unit tests
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        if [ -f package.json ]; then npm run test:unit --if-present; fi
+    - name: Run integration tests
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        if [ -f package.json ]; then npm run test:integration --if-present; fi
+    - name: Run tests with coverage
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        echo "No test framework detected; running generic test discovery"
+        if [ -f package.json ]; then npm test --if-present -- --coverage; fi
+    - name: Upload test artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: |
+          coverage/
+          test-results/
+        if-no-files-found: ignore
+    - name: Upload coverage artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-artifacts
+        path: |
+          coverage/**
+        if-no-files-found: ignore
+    - name: Upload CI artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-ci-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  security:
+    name: Security (code, secret, dependency scan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Code scan (Semgrep)
+      uses: returntocorp/semgrep-action@v1
+      continue-on-error: true
+    - name: Secret scan (Gitleaks)
+      uses: gitleaks/gitleaks-action@v1.1.0
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Dependency scan
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        if [ -f package.json ]; then npm audit --audit-level=high; fi
+        if [ -f requirements.txt ]; then pip-audit -r requirements.txt; fi
+  build:
+    name: Build and scan image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - validate
+    - test
+    - security
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Build image
+      run: |
+        docker build -t "${{ secrets.ECR_REPOSITORY_URL }}:${{ github.sha }}" -f Dockerfile .
+    - name: Scan image with Trivy
+      uses: aquasecurity/trivy-action@0.36.0
+      with:
+        image-ref: ${{ secrets.ECR_REPOSITORY_URL }}:${{ github.sha }}
+        format: table
+        exit-code: '1'
+        severity: CRITICAL,HIGH
+    - name: Push image
+      run: |
+        docker push "${{ secrets.ECR_REPOSITORY_URL }}:${{ github.sha }}"
+        docker tag "${{ secrets.ECR_REPOSITORY_URL }}:${{ github.sha }}" "${{ secrets.ECR_REPOSITORY_URL }}:latest"
+        docker push "${{ secrets.ECR_REPOSITORY_URL }}:latest"
+    - name: Upload build artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  deploy:
+    name: Deploy to ECS Fargate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    - name: Download current task definition
+      run: |
+        aws ecs describe-task-definition --task-definition ${{ secrets.ECS_TASK_FAMILY }} --query taskDefinition | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' > task-definition.json
+    - name: Render task definition with new image
+      id: render-task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition.json
+        container-name: ${{ secrets.CONTAINER_NAME }}
+        image: ${{ secrets.ECR_REPOSITORY_URL }}:${{ github.sha }}
+    - name: Deploy task definition
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+        service: ${{ secrets.ECS_SERVICE_NAME }}
+        cluster: ${{ secrets.ECS_CLUSTER_NAME }}
+        wait-for-service-stability: true
+    - name: Print ECS service events on failure
+      if: failure()
+      run: |
+        aws ecs describe-services \
+          --cluster ${{ secrets.ECS_CLUSTER_NAME }} \
+          --services ${{ secrets.ECS_SERVICE_NAME }} \
+          --query 'services[0].events[:10]' || true
+        aws ecs describe-tasks \
+          --cluster ${{ secrets.ECS_CLUSTER_NAME }} \
+          --tasks $(aws ecs list-tasks --cluster ${{ secrets.ECS_CLUSTER_NAME }} --service-name ${{ secrets.ECS_SERVICE_NAME }} --query 'taskArns' --output text) \
+          --query 'tasks[].{name: group, stopReason: stopReason, lastStatus: lastStatus}' || true
+  rollback:
+    name: Rollback on failed deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - deploy
+    if: failure() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    - name: Roll back to previous task definition revision
+      run: |
+        set -e
+        CURRENT=$(aws ecs describe-services --cluster ${{ secrets.ECS_CLUSTER_NAME }} --services ${{ secrets.ECS_SERVICE_NAME }} --query 'services[0].taskDefinition' --output text)
+        FAMILY=$(echo "$CURRENT" | sed 's/:.*//')
+        REV=$(echo "$CURRENT" | sed 's/.*://')
+        PREV=$((REV - 1))
+        if [ "$PREV" -lt 1 ]; then echo "No previous revision to roll back to"; exit 1; fi
+        aws ecs update-service --cluster ${{ secrets.ECS_CLUSTER_NAME }} --service ${{ secrets.ECS_SERVICE_NAME }} --task-definition "${FAMILY}:${PREV}" --force-new-deployment
+        aws ecs wait services-stable --cluster ${{ secrets.ECS_CLUSTER_NAME }} --services ${{ secrets.ECS_SERVICE_NAME }}
+  post-deploy:
+    name: Post deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - deploy
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    - name: Report deployment status
+      run: 'aws ecs describe-services --cluster ${{ secrets.ECS_CLUSTER_NAME }} --services
+        ${{ secrets.ECS_SERVICE_NAME }} --query ''services[0].{status: status, running:
+        runningCount, desired: desiredCount, taskDef: taskDefinition}'' --output table'
