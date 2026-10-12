@@ -30,7 +30,7 @@ RUN chown -R appuser:0 /usr/share/nginx/html && \
 # Create health endpoint file
 RUN echo "OK" > /usr/share/nginx/html/health
 
-USER appuser
+# USER appuser
 
 EXPOSE 80
 
