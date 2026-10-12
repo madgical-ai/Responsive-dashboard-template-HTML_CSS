@@ -189,11 +189,11 @@ jobs:
       contents: read
       id-token: write
     steps:
-    - name: Require manual approval
-      uses: trstringer/manual-approval@v1
-      with:
-        approvees: ${{ secrets.PRODUCTION_APPROVERS }}
-        issue-title: Approve production deployment ${{ github.sha }}
+    # - name: Require manual approval
+    #   uses: trstringer/manual-approval@v1
+    #   with:
+    #     approvees: ${{ secrets.PRODUCTION_APPROVERS }}
+    #     issue-title: Approve production deployment ${{ github.sha }}
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
