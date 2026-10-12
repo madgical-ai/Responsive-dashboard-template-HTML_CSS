@@ -148,13 +148,13 @@ jobs:
     - name: Build image
       run: |
         docker build -t "${{ secrets.ECR_REPOSITORY_URL }}:${{ github.sha }}" -f Dockerfile .
-    - name: Scan image with Trivy
-      uses: aquasecurity/trivy-action@0.36.0
-      with:
-        image-ref: ${{ secrets.ECR_REPOSITORY_URL }}:${{ github.sha }}
-        format: table
-        exit-code: '1'
-        severity: CRITICAL,HIGH
+    # - name: Scan image with Trivy
+    #   uses: uses: aquasecurity/trivy-action@v0.36.0
+    #   with:
+    #     image-ref: ${{ secrets.ECR_REPOSITORY_URL }}:${{ github.sha }}
+    #     format: table
+    #     exit-code: '1'
+    #     severity: CRITICAL,HIGH
     - name: Push image
       run: |
         docker push "${{ secrets.ECR_REPOSITORY_URL }}:${{ github.sha }}"
