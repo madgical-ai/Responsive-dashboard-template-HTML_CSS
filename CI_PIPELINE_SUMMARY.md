@@ -1,85 +1,99 @@
-# CI/CD Pipeline Walkthrough
+## Pipeline Walkthrough
 
-This pipeline takes a commit from `main` through security scanning, testing, container build, and staged ECS deployment with manual production approval and rollback safety nets.
+This CI pipeline automates validation, testing, security scanning, image building, publishing, and staging validation for the project. It runs on pushes to `main` and pull requests targeting `main`. Concurrency settings cancel in-progress runs for the same workflow and ref.
 
 ## Prerequisites
 
-Before CI can run, the project and AWS environment must provide:
+Before CI can run successfully, ensure the following:
 
-- **Runtime**: Node.js 20 (installed via `actions/setup-node`); `npm ci` requires a committed `package-lock.json`.
-- **Docker base image**: `nginx:alpine` (from `Dockerfile`).
-- **System packages in image**: `curl` (installed in the Dockerfile).
-- **Exposed port**: `80` (container listens on 80; workflow maps `HOST_PORT=80` → `CONTAINER_PORT=80`).
-- **Entrypoint**: `nginx -g 'daemon off;'` serving static content from `/usr/share/nginx/html`.
-- **Runner**: `ubuntu-latest` with Docker/Buildx available.
-- **Required GitHub secrets**:
-  - `AWS_REGION` — AWS region for all operations
-  - `AWS_DEPLOY_ROLE_ARN` — IAM role assumed via OIDC (`id-token: write` permission)
-  - `ECR_REPOSITORY_URL` — target ECR repository
-  - `ECS_CLUSTER_NAME`, `ECS_SERVICE_NAME`, `ECS_TASK_FAMILY`, `CONTAINER_NAME` — ECS deployment targets
-  - `PRODUCTION_APPROVERS` — GitHub usernames allowed to approve production deploys
-- **AWS side**: An existing ECS cluster/service/task definition, an ECR repo, and an IAM deploy role trusting GitHub OIDC.
-- **Tools installed in-flight**: Trivy, gitleaks v8.18.4, `jq` (preinstalled on runners).
+- **Runtime**: Node.js 20 (used for application linting and testing if configured). The workflow uses `actions/setup-node@v4` with `node-version: '20'`.
+- **Docker base image**: `nginx:1.27-alpine` (from the Dockerfile). The build job creates an image from this base.
+- **System packages**: None explicitly installed. The workflow relies on pre-installed tools on `ubuntu-latest` runners (Docker, curl, etc.). Hadolint, Trivy, and Gitleaks are provided via GitHub Actions.
+- **Exposed ports**: The Dockerfile exposes ports `80` and `8080`. The staging-validation job maps host port `80` to container port `80` by default (via `HOST_PORT` and `CONTAINER_PORT` env vars). Ensure the application listens on port `80` for the health check to pass.
+- **Required environment variables / secrets**:
+  - `REGISTRY`: `ghcr.io` (set in workflow env)
+  - `IMAGE_TAG`: `${{ github.sha }}` (set in workflow env)
+  - `HOST_PORT`: `'80'` (set in workflow env)
+  - `CONTAINER_PORT`: `'80'` (set in workflow env)
+  - `GITHUB_TOKEN`: Automatically provided; used by Gitleaks and for GHCR login. Requires `packages: write` permission for the publish job.
+- **Build args**: None specified in the Docker build command. If your Dockerfile requires build arguments, add them to the `docker build` step in the `build` job.
 
-## Pipeline Flow
+## Job Details
 
-```
-security ─┐
-          ├─► build ─► deploy-staging ─► deploy-production ─► post-deploy
-test ─────┘                                        │
-                                                   └─► (manual dispatch) rollback
-```
+### Validate
+Runs on `ubuntu-latest`. Steps:
+1. Checkout repository.
+2. Lint Dockerfile with Hadolint (failure threshold: error).
+3. Detect linter configuration (`.eslintrc*` or `eslint.config.*`). If found, set up Node.js 20 and run `npx eslint .`. If not found, echo a message.
 
-### 1. Security Scans
-Runs on every push and PR. Three independent checks:
-- **Trivy** scans the filesystem for HIGH/CRITICAL vulnerabilities in dependencies — fails the job if found.
-- **gitleaks** scans the working tree for committed secrets (redacted output, fails on detection).
-- **CodeQL** performs static security analysis on JavaScript code; results are uploaded to the Security tab (`security-events: write`).
+### Test
+Runs on `ubuntu-latest`. Steps:
+1. Checkout repository.
+2. Detect test tooling: `package.json` with a `test` script (runner: npm) or `Makefile` with a `test` target (runner: make).
+3. If npm: set up Node.js 20, cache npm dependencies (if `package-lock.json` exists), install dependencies (`npm ci` or `npm install`), run `npm test -- --coverage`.
+4. If make: run `make test`.
+5. If no test tooling: echo a message.
+6. Always upload test results (`coverage/`, `junit.xml`, `test-results/`) and artifacts (`reports/**`, `dist/**`).
 
-### 2. Unit and Integration Tests
-Sets up Node 20, installs dependencies with `npm ci` (deterministic, lockfile-based), and runs tests with coverage. Coverage reports plus any `reports/` and `dist/` output are uploaded as artifacts for inspection.
+### Security - Dependency Scan
+Runs on `ubuntu-latest`. Uses Trivy to scan the filesystem for vulnerabilities (CRITICAL, HIGH) with exit code 1 on findings.
 
-### 3. Build, Scan and Push Image
-Only runs for pushes to `main` or manual dispatch (skipped on PRs). After security and tests pass:
-1. Assumes the AWS deploy role via OIDC and logs into ECR.
-2. Builds the Docker image (nginx:alpine base) using GitHub Actions cache (`type=gha`) for speed.
-3. Scans the built image with Trivy — HIGH/CRITICAL findings fail the pipeline before anything is pushed.
-4. Pushes the image tagged with the commit SHA and `latest`.
+### Security - Secret Scan
+Runs on `ubuntu-latest`. Uses Gitleaks to scan for leaked secrets. Requires `GITHUB_TOKEN`.
 
-### 4. Deploy to Staging
-Fetches the current ECS task definition, swaps in the new image (SHA tag), and deploys to the ECS service, waiting for stability. If deployment fails, it automatically rolls back to the previously running task definition and prints recent service events for debugging.
+### Build and Scan Image
+Needs: validate, test, security-dependency-scan, security-secret-scan. Runs only on push to `main` or `workflow_dispatch`. Steps:
+1. Checkout repository.
+2. Set up Docker Buildx.
+3. Resolve lowercase image name (`ghcr.io/owner/repo`).
+4. Build Docker image with tags `${{ github.sha }}` and `latest`.
+5. Scan image with Trivy (CRITICAL, HIGH, exit code 1).
+6. Save image to tarball and upload as `docker-image` artifact.
+7. Upload build artifacts (`reports/**`, `dist/**`).
 
-### 5. Deploy to Production
-Identical deploy process, but gated by a **manual approval** step: a GitHub issue is created and a listed approver must approve before AWS credentials are even configured. Same rollback-on-failure behavior as staging.
+### Publish Image
+Needs: build. Runs only on push to `main` or `workflow_dispatch`. Permissions: `contents: read`, `packages: write`. Steps:
+1. Download `docker-image` artifact.
+2. Load image.
+3. Resolve lowercase image name.
+4. Log in to GHCR using `GITHUB_TOKEN`.
+5. Push both tags (`${{ github.sha }}` and `latest`).
+6. Upload artifacts.
 
-### 6. Post Deploy Verification
-Confirms the ECS service reaches a stable state and prints desired vs. running task counts as a final health check.
+### Staging - Container Health and Smoke Test
+Needs: build. Runs only on push to `main` or `workflow_dispatch`. Steps:
+1. Download `docker-image` artifact.
+2. Load image.
+3. Resolve lowercase image name.
+4. Run container in detached mode, mapping host port 80 to container port 80.
+5. Wait for health endpoint `/healthz` (up to 60 seconds).
+6. Smoke test homepage `/`.
+7. Stop and remove container.
+8. Print logs on failure.
+9. Upload artifacts.
 
-### 7. Rollback (Manual)
-Triggered only via `workflow_dispatch`. Computes the previous task definition revision and forces the service back to it, waiting for stability. Fails safely if no earlier revision exists.
+## Flow and Connections
 
-## Key Design Points
-- **Concurrency**: One run per branch — new pushes cancel in-progress runs.
-- **OIDC auth**: No long-lived AWS keys; short-lived tokens via `id-token: write`.
-- **SHA-tagged images**: Every deploy is traceable to an exact commit.
-- **Defense in depth**: Dependency scan, secret scan, SAST, and image scan all gate the build.
-- **Local runs**: Steps guarded by `ACT != 'true'` are skipped when running with [act](https://github.com/nektos/act) locally.
+On pull requests, only **Validate**, **Test**, and the two **Security** jobs run. On pushes to `main`, after those pass, **Build and Scan Image** runs. Then **Publish Image** and **Staging Validation** run in parallel (both depend on build). Publish pushes the image to GHCR; staging validation runs the container to verify health and basic functionality.
 
-## Onboarding Tips
-- To trigger a full deploy without a code change, use **workflow_dispatch** on `main`.
-- If production deploy stalls, check the approval issue created by the `manual-approval` step.
-- If a deploy fails, check the printed ECS service events table in the failed job log before re-running.
+## Artifacts
+
+- `test-results`: coverage, junit.xml, test-results/
+- `test-artifacts`: reports/**, dist/**
+- `docker-image`: image.tar
+- `build-artifacts`, `publish-artifacts`, `staging-validation-artifacts`: reports/**, dist/**
+
+Note: Several jobs upload the same paths (`reports/**`, `dist/**`), which may be redundant.
+
+## Risks and Recommendations
+
+- **PRs skip build and staging**: Consider adding a build-only job for PRs to catch build failures early.
+- **Port mismatch**: The staging validation assumes the app listens on port 80. If your app listens on 8080, adjust `CONTAINER_PORT` or the Dockerfile.
+- **Health endpoint**: Ensure `/healthz` exists; otherwise staging validation fails.
+- **Workflow dispatch**: The workflow does not trigger on `workflow_dispatch` despite conditions checking for it. Add `workflow_dispatch:` to the `on:` block for manual runs.
+- **No build caching**: Consider using `docker/build-push-action` with cache to speed up builds.
 
 ### Required GitHub Secrets
 
 Auto-provisioned by this pipeline:
 - [x] `AWS_DEPLOY_ROLE_ARN`
-- [x] `AWS_REGION`
-- [x] `CONTAINER_NAME`
-- [x] `ECR_REPOSITORY_URL`
-- [x] `ECS_CLUSTER_NAME`
-- [x] `ECS_SERVICE_NAME`
-- [x] `ECS_TASK_FAMILY`
-
-Unresolved / failed to provision (add manually in GitHub before merging):
-- [ ] `PRODUCTION_APPROVERS`
