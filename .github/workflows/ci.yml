@@ -232,45 +232,39 @@ jobs:
 
 
 
-    - name: Ensure SSM Agent is running
+    
+    - name: Diagnose EC2 and SSM target
       shell: bash
       env:
-        AWS_REGION: ${{ secrets.AWS_REGION }}
-        EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        AWS_REGION: ${{ env.AWS_REGION }}
       run: |
         set -euo pipefail
 
-        COMMANDS_JSON=$(jq -n '{
-          commands: [
-            "set -e",
-            "if command -v systemctl >/dev/null 2>&1; then",
-            "  if systemctl list-unit-files amazon-ssm-agent.service --no-legend 2>/dev/null | grep -q amazon-ssm-agent; then",
-            "    systemctl enable amazon-ssm-agent || true",
-            "    systemctl start amazon-ssm-agent || true",
-            "    systemctl status amazon-ssm-agent --no-pager",
-            "  elif command -v snap >/dev/null 2>&1 && snap list amazon-ssm-agent >/dev/null 2>&1; then",
-            "    snap start amazon-ssm-agent || true",
-            "    snap services amazon-ssm-agent",
-            "  else",
-            "    echo SSM Agent is not installed",
-            "    exit 1",
-            "  fi",
-            "else",
-            "  echo systemctl is unavailable",
-            "  exit 1",
-            "fi"
-          ]
-        }')
+        echo "=== AWS identity ==="
+        aws sts get-caller-identity
 
-        COMMAND_ID=$(aws ssm send-command \
-          --instance-ids "$EC2_INSTANCE_ID" \
+        echo "=== EC2 target ==="
+        aws ec2 describe-instances \
           --region "$AWS_REGION" \
-          --document-name AWS-RunShellScript \
-          --parameters "$COMMANDS_JSON" \
-          --query 'Command.CommandId' \
-          --output text)
+          --instance-ids "$INSTANCE_ID" \
+          --query 'Reservations[0].Instances[0].{ID:InstanceId,State:State.Name,Account:OwnerId,Region:Placement.AvailabilityZone}' \
+          --output json
 
-        echo "SSM command ID: $COMMAND_ID"
+        echo "=== SSM managed-node registration ==="
+        aws ssm describe-instance-information \
+          --region "$AWS_REGION" \
+          --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+          --output json
+
+        echo "=== SSM SendCommand test ==="
+        aws ssm send-command \
+          --region "$AWS_REGION" \
+          --instance-ids "$INSTANCE_ID" \
+          --document-name "AWS-RunShellScript" \
+          --parameters '{"commands":["echo SSM_OK"]}' \
+          --output json
+
     - name: Deploy container to EC2 via SSM
       shell: bash
       run: |
