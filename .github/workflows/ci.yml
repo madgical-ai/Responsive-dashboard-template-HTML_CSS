@@ -242,6 +242,10 @@ jobs:
         RUNNING_ID=$(aws ec2 describe-instances --region "$AWS_REGION" --filters "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
         if [ -n "$RUNNING_ID" ] && [ "$RUNNING_ID" != "None" ]; then TARGET_ID="$RUNNING_ID"; fi
         echo "Target EC2 instance: $TARGET_ID"
+        echo "=== ALL EC2 INSTANCES ==="
+        aws ec2 describe-instances --region "$AWS_REGION" --query "Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]" --output table || true
+        echo "=== ALL SSM MANAGED INSTANCES ==="
+        aws ssm describe-instance-information --region "$AWS_REGION" --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName]" --output table || true
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
         IMAGE="${REGISTRY}/${IMAGE_REPO}:${IMAGE_TAG}"
 
@@ -316,6 +320,10 @@ jobs:
         RUNNING_ID=$(aws ec2 describe-instances --region "$AWS_REGION" --filters "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
         if [ -n "$RUNNING_ID" ] && [ "$RUNNING_ID" != "None" ]; then TARGET_ID="$RUNNING_ID"; fi
         echo "Target EC2 instance: $TARGET_ID"
+        echo "=== ALL EC2 INSTANCES ==="
+        aws ec2 describe-instances --region "$AWS_REGION" --query "Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]" --output table || true
+        echo "=== ALL SSM MANAGED INSTANCES ==="
+        aws ssm describe-instance-information --region "$AWS_REGION" --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName]" --output table || true
         HEALTH_JSON=$(jq -n --arg hp "${HOST_PORT}" '{commands: ["set -e", "for i in $(seq 1 12); do curl -fsS http://localhost:" + ($hp | @sh) + "/ >/dev/null 2>&1 && exit 0 || sleep 5; done; exit 1"]}')
         CMD_ID=$(aws ssm send-command \
           --instance-ids "$TARGET_ID" \
@@ -345,6 +353,10 @@ jobs:
         RUNNING_ID=$(aws ec2 describe-instances --region "$AWS_REGION" --filters "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
         if [ -n "$RUNNING_ID" ] && [ "$RUNNING_ID" != "None" ]; then TARGET_ID="$RUNNING_ID"; fi
         echo "Target EC2 instance: $TARGET_ID"
+        echo "=== ALL EC2 INSTANCES ==="
+        aws ec2 describe-instances --region "$AWS_REGION" --query "Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]" --output table || true
+        echo "=== ALL SSM MANAGED INSTANCES ==="
+        aws ssm describe-instance-information --region "$AWS_REGION" --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName]" --output table || true
         SMOKE_JSON=$(jq -n --arg hp "${HOST_PORT}" '{commands: ["set -e", "curl -fsS http://localhost:" + ($hp | @sh) + "/ | grep -qi \"<html\""]}')
         CMD_ID=$(aws ssm send-command \
           --instance-ids "$TARGET_ID" \
@@ -394,6 +406,10 @@ jobs:
         RUNNING_ID=$(aws ec2 describe-instances --region "$AWS_REGION" --filters "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
         if [ -n "$RUNNING_ID" ] && [ "$RUNNING_ID" != "None" ]; then TARGET_ID="$RUNNING_ID"; fi
         echo "Target EC2 instance: $TARGET_ID"
+        echo "=== ALL EC2 INSTANCES ==="
+        aws ec2 describe-instances --region "$AWS_REGION" --query "Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]" --output table || true
+        echo "=== ALL SSM MANAGED INSTANCES ==="
+        aws ssm describe-instance-information --region "$AWS_REGION" --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName]" --output table || true
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
         IMAGE="${REGISTRY}/${IMAGE_REPO}:${IMAGE_TAG}"
 
@@ -468,6 +484,10 @@ jobs:
         RUNNING_ID=$(aws ec2 describe-instances --region "$AWS_REGION" --filters "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
         if [ -n "$RUNNING_ID" ] && [ "$RUNNING_ID" != "None" ]; then TARGET_ID="$RUNNING_ID"; fi
         echo "Target EC2 instance: $TARGET_ID"
+        echo "=== ALL EC2 INSTANCES ==="
+        aws ec2 describe-instances --region "$AWS_REGION" --query "Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]" --output table || true
+        echo "=== ALL SSM MANAGED INSTANCES ==="
+        aws ssm describe-instance-information --region "$AWS_REGION" --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName]" --output table || true
         HEALTH_JSON=$(jq -n --arg hp "${HOST_PORT}" '{commands: ["set -e", "for i in $(seq 1 12); do curl -fsS http://localhost:" + ($hp | @sh) + "/ >/dev/null 2>&1 && exit 0 || sleep 5; done; exit 1"]}')
         CMD_ID=$(aws ssm send-command \
           --instance-ids "$TARGET_ID" \
@@ -497,6 +517,10 @@ jobs:
         RUNNING_ID=$(aws ec2 describe-instances --region "$AWS_REGION" --filters "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
         if [ -n "$RUNNING_ID" ] && [ "$RUNNING_ID" != "None" ]; then TARGET_ID="$RUNNING_ID"; fi
         echo "Target EC2 instance: $TARGET_ID"
+        echo "=== ALL EC2 INSTANCES ==="
+        aws ec2 describe-instances --region "$AWS_REGION" --query "Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]" --output table || true
+        echo "=== ALL SSM MANAGED INSTANCES ==="
+        aws ssm describe-instance-information --region "$AWS_REGION" --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName]" --output table || true
         SMOKE_JSON=$(jq -n --arg hp "${HOST_PORT}" '{commands: ["set -e", "curl -fsS http://localhost:" + ($hp | @sh) + "/ | grep -qi \"<html\""]}')
         CMD_ID=$(aws ssm send-command \
           --instance-ids "$TARGET_ID" \
@@ -546,6 +570,10 @@ jobs:
         RUNNING_ID=$(aws ec2 describe-instances --region "$AWS_REGION" --filters "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
         if [ -n "$RUNNING_ID" ] && [ "$RUNNING_ID" != "None" ]; then TARGET_ID="$RUNNING_ID"; fi
         echo "Target EC2 instance: $TARGET_ID"
+        echo "=== ALL EC2 INSTANCES ==="
+        aws ec2 describe-instances --region "$AWS_REGION" --query "Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]" --output table || true
+        echo "=== ALL SSM MANAGED INSTANCES ==="
+        aws ssm describe-instance-information --region "$AWS_REGION" --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName]" --output table || true
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
         IMAGE="${REGISTRY}/${IMAGE_REPO}:latest"
 
@@ -628,6 +656,10 @@ jobs:
         RUNNING_ID=$(aws ec2 describe-instances --region "$AWS_REGION" --filters "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
         if [ -n "$RUNNING_ID" ] && [ "$RUNNING_ID" != "None" ]; then TARGET_ID="$RUNNING_ID"; fi
         echo "Target EC2 instance: $TARGET_ID"
+        echo "=== ALL EC2 INSTANCES ==="
+        aws ec2 describe-instances --region "$AWS_REGION" --query "Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]" --output table || true
+        echo "=== ALL SSM MANAGED INSTANCES ==="
+        aws ssm describe-instance-information --region "$AWS_REGION" --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName]" --output table || true
         VERIFY_JSON=$(jq -n --arg hp "${HOST_PORT}" '{commands: ["set -e", "curl -fsS http://localhost:" + ($hp | @sh) + "/health || curl -fsS http://localhost:" + ($hp | @sh) + "/"]}')
         CMD_ID=$(aws ssm send-command \
           --instance-ids "$TARGET_ID" \
