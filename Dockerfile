@@ -1,39 +1,30 @@
-FROM nginx:alpine
+FROM nginxinc/nginx-unprivileged:alpine
 
-LABEL maintainer="AI DevOps Agent"
-LABEL name="static-website"
-LABEL description="Static HTML website served with nginx"
-LABEL version="1.0.0"
+LABEL org.opencontainers.image.title="madgical-ai-responsive-dashboard" \
+      org.opencontainers.image.description="Static HTML/CSS dashboard served by unprivileged nginx" \
+      org.opencontainers.image.version="1.0.0"
 
-# Install curl for healthcheck and create non-root user
-RUN apk add --no-cache curl && \
-    adduser -S appuser
+USER root
 
-WORKDIR /usr/share/nginx/html
+# Static assets (grouped for better layer caching: rarely-changing assets first)
+COPY css/ /usr/share/nginx/html/css/
+COPY webfonts/ /usr/share/nginx/html/webfonts/
+COPY imgs/ /usr/share/nginx/html/imgs/
 
-# Copy static assets first (grouped for layer caching)
-COPY css/ css/
-COPY webfonts/ webfonts/
-COPY imgs/ imgs/
+# HTML entry points
+COPY *.html /usr/share/nginx/html/
 
-# Copy HTML source files
-COPY *.html ./
+# Lightweight health endpoint file + correct ownership for the non-root user
+RUN printf 'OK\n' > /usr/share/nginx/html/health && \
+    chown -R 101:0 /usr/share/nginx/html && \
+    chmod -R g+rwX /usr/share/nginx/html
 
-# Copy custom nginx config if needed and fix permissions for non-root runtime
-RUN chown -R appuser:0 /usr/share/nginx/html && \
-    chmod -R g+rw /usr/share/nginx/html && \
-    chown -R appuser:0 /var/cache/nginx && \
-    chown -R appuser:0 /var/run && \
-    mkdir -p /var/cache/nginx/client_temp && \
-    chown -R appuser:0 /var/cache/nginx/client_temp
+# Drop privileges to the non-root nginx user (uid 101)
+USER 101
 
-# Create health endpoint file
-RUN echo "OK" > /usr/share/nginx/html/health
+EXPOSE 8080
 
-# USER appuser
-
-EXPOSE 80
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD curl --fail http://localhost:80/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -qO- http://127.0.0.1:8080/health || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]
