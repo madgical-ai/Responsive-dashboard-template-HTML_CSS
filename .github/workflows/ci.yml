@@ -232,7 +232,7 @@ jobs:
 
 
 
-    - name: Diagnose SSM target
+    - name: Ensure SSM Agent is running
       shell: bash
       env:
         AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -240,22 +240,37 @@ jobs:
       run: |
         set -euo pipefail
 
-        echo "=== AWS account ==="
-        aws sts get-caller-identity
+        COMMANDS_JSON=$(jq -n '{
+          commands: [
+            "set -e",
+            "if command -v systemctl >/dev/null 2>&1; then",
+            "  if systemctl list-unit-files amazon-ssm-agent.service --no-legend 2>/dev/null | grep -q amazon-ssm-agent; then",
+            "    systemctl enable amazon-ssm-agent || true",
+            "    systemctl start amazon-ssm-agent || true",
+            "    systemctl status amazon-ssm-agent --no-pager",
+            "  elif command -v snap >/dev/null 2>&1 && snap list amazon-ssm-agent >/dev/null 2>&1; then",
+            "    snap start amazon-ssm-agent || true",
+            "    snap services amazon-ssm-agent",
+            "  else",
+            "    echo SSM Agent is not installed",
+            "    exit 1",
+            "  fi",
+            "else",
+            "  echo systemctl is unavailable",
+            "  exit 1",
+            "fi"
+          ]
+        }')
 
-        echo "=== EC2 state ==="
-        aws ec2 describe-instances \
-          --region "$AWS_REGION" \
+        COMMAND_ID=$(aws ssm send-command \
           --instance-ids "$EC2_INSTANCE_ID" \
-          --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name}' \
-          --output table
-
-        echo "=== SSM registration ==="
-        aws ssm describe-instance-information \
           --region "$AWS_REGION" \
-          --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
-          --query 'InstanceInformationList[].{ID:InstanceId,PingStatus:PingStatus,Platform:PlatformName}' \
-          --output table
+          --document-name AWS-RunShellScript \
+          --parameters "$COMMANDS_JSON" \
+          --query 'Command.CommandId' \
+          --output text)
+
+        echo "SSM command ID: $COMMAND_ID"
     - name: Deploy container to EC2 via SSM
       shell: bash
       run: |
