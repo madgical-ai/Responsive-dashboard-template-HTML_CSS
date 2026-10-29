@@ -229,6 +229,33 @@ jobs:
       with:
         role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
         aws-region: ${{ env.AWS_REGION }}
+
+
+
+    - name: Diagnose SSM target
+      shell: bash
+      env:
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+        EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+      run: |
+        set -euo pipefail
+
+        echo "=== AWS account ==="
+        aws sts get-caller-identity
+
+        echo "=== EC2 state ==="
+        aws ec2 describe-instances \
+          --region "$AWS_REGION" \
+          --instance-ids "$EC2_INSTANCE_ID" \
+          --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name}' \
+          --output table
+
+        echo "=== SSM registration ==="
+        aws ssm describe-instance-information \
+          --region "$AWS_REGION" \
+          --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
+          --query 'InstanceInformationList[].{ID:InstanceId,PingStatus:PingStatus,Platform:PlatformName}' \
+          --output table
     - name: Deploy container to EC2 via SSM
       shell: bash
       run: |
