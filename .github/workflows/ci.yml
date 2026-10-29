@@ -124,8 +124,8 @@ jobs:
     - validate
     - test
     - security
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-      }}
+    # if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    #   }}
     permissions:
       contents: read
       packages: write
@@ -177,8 +177,8 @@ jobs:
     timeout-minutes: 30
     needs:
     - build
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-      }}
+    # if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    #   }}
     permissions:
       contents: read
       packages: write
@@ -217,8 +217,8 @@ jobs:
     timeout-minutes: 30
     needs:
     - publish
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-      }}
+    # if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    #   }}
     permissions:
       id-token: write
       contents: read
@@ -341,8 +341,8 @@ jobs:
     timeout-minutes: 30
     needs:
     - deploy
-    if: ${{ failure() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-      }}
+    # if: ${{ failure() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    #   }}
     permissions:
       id-token: write
       contents: read
