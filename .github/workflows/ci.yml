@@ -70,12 +70,12 @@ jobs:
     - name: Integration test (container responds)
       if: ${{ env.ACT != 'true' }}
       run: |
-        docker run -d --name ci-integration -p 8080:8080 "${{ steps.image.outputs.ref }}"
+        docker run -d --name ci-integration -p 8888:8080 "${{ steps.image.outputs.ref }}"
         for i in $(seq 1 12); do
-          if curl -fsS http://localhost:8080/ >/dev/null 2>&1; then break; fi
+          if curl -fsS http://127.0.0.1:8888/ >/dev/null 2>&1; then break; fi
           sleep 2
         done
-        curl -fsS http://localhost:8080/ >/dev/null
+        curl -fsS http://127.0.0.1:8888/ >/dev/null
         docker rm -f ci-integration
     - name: Coverage
       if: ${{ env.ACT != 'true' }}
