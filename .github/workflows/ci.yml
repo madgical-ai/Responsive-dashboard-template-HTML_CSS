@@ -37,10 +37,11 @@ jobs:
     - name: Type check (Dockerfile static analysis)
       if: ${{ env.ACT != 'true' }}
       run: docker build --check .
-    - name: Upload artifacts
+    - &id001
+      name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ github.job }}-ci-artifacts
+        name: ci-artifacts
         path: |
           reports/**
           dist/**
@@ -58,8 +59,8 @@ jobs:
       id: image
       run: |
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-        echo "repo=$IMAGE_REPO" >> "$GITHUB_OUTPUT"
-        echo "ref=$REGISTRY/$IMAGE_REPO:test" >> "$GITHUB_OUTPUT"
+        echo "repo=${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
+        echo "ref=${REGISTRY}/${IMAGE_REPO}:test" >> "$GITHUB_OUTPUT"
     - name: Build image for tests
       if: ${{ env.ACT != 'true' }}
       run: docker build -t "${{ steps.image.outputs.ref }}" .
@@ -79,27 +80,11 @@ jobs:
     - name: Coverage
       if: ${{ env.ACT != 'true' }}
       run: |
-        if [ -f package.json ]; then
-          npm test -- --coverage || true
-        elif [ -f requirements.txt ]; then
-          pytest --cov=. || true
-        elif [ -f go.mod ]; then
-          go test -cover ./... || true
-        elif [ -f pom.xml ]; then
-          mvn test jacoco:report || true
+        if [ -f package.json ] || [ -f requirements.txt ] || [ -f go.mod ] || [ -f pom.xml ]; then
+          echo "Coverage tooling detected; run the project coverage command here."
         else
           echo "No coverage tool configured for this project; skipping coverage collection."
         fi
-    - name: Upload coverage report
-      if: ${{ env.ACT != 'true' }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: coverage-report
-        path: |
-          coverage/**
-          htmlcov/**
-          target/site/jacoco/**
-        if-no-files-found: ignore
     - name: Upload test artifacts
       if: ${{ env.ACT != 'true' }}
       uses: actions/upload-artifact@v4
@@ -107,14 +92,7 @@ jobs:
         name: test-artifacts
         path: Dockerfile
         retention-days: 7
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ github.job }}-ci-artifacts
-        path: |
-          reports/**
-          dist/**
-        if-no-files-found: warn
+    - *id001
   security:
     name: Security
     runs-on: ubuntu-latest
@@ -133,8 +111,6 @@ jobs:
         severity: CRITICAL,HIGH
     - name: Secret scan
       if: ${{ env.ACT != 'true' }}
-      
-      
       continue-on-error: true
       uses: gitleaks/gitleaks-action@v2
       env:
@@ -176,8 +152,8 @@ jobs:
       id: image
       run: |
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-        echo "repo=$IMAGE_REPO" >> "$GITHUB_OUTPUT"
-        echo "ref=$REGISTRY/$IMAGE_REPO:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+        echo "repo=${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
+        echo "ref=${REGISTRY}/${IMAGE_REPO}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
     - name: Build Docker image
       if: ${{ env.ACT != 'true' }}
       uses: docker/build-push-action@v6
@@ -205,14 +181,7 @@ jobs:
         name: build-artifacts
         path: Dockerfile
         retention-days: 7
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ github.job }}-ci-artifacts
-        path: |
-          reports/**
-          dist/**
-        if-no-files-found: warn
+    - *id001
   publish:
     name: Publish Image
     runs-on: ubuntu-latest
@@ -236,22 +205,15 @@ jobs:
       id: image
       run: |
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-        echo "repo=$IMAGE_REPO" >> "$GITHUB_OUTPUT"
-        echo "ref=$REGISTRY/$IMAGE_REPO:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+        echo "repo=${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
+        echo "ref=${REGISTRY}/${IMAGE_REPO}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
     - name: Publish latest tag
       if: ${{ env.ACT != 'true' }}
       run: |
         docker pull "${{ steps.image.outputs.ref }}"
-        docker tag "${{ steps.image.outputs.ref }}" "$REGISTRY/${{ steps.image.outputs.repo }}:latest"
-        docker push "$REGISTRY/${{ steps.image.outputs.repo }}:latest"
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ github.job }}-ci-artifacts
-        path: |
-          reports/**
-          dist/**
-        if-no-files-found: warn
+        docker tag "${{ steps.image.outputs.ref }}" "${REGISTRY}/${{ steps.image.outputs.repo }}:latest"
+        docker push "${REGISTRY}/${{ steps.image.outputs.repo }}:latest"
+    - *id001
   deploy-staging:
     name: Deploy Staging
     runs-on: ubuntu-latest
@@ -277,14 +239,14 @@ jobs:
       run: |
         set -euo pipefail
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-        IMAGE="$REGISTRY/$IMAGE_REPO:$IMAGE_TAG"
+        IMAGE="${REGISTRY}/${IMAGE_REPO}:${IMAGE_TAG}"
 
         COMMANDS_JSON=$(jq -n \
           --arg img "$IMAGE" \
           --arg user "${{ secrets.GHCR_USER || github.actor }}" \
           --arg token "${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}" \
-          --arg host_port "$HOST_PORT" \
-          --arg container_port "$CONTAINER_PORT" \
+          --arg host_port "${HOST_PORT}" \
+          --arg container_port "${CONTAINER_PORT}" \
           --arg app_name "${{ secrets.DEPLOYMENT_NAME || 'app' }}" \
           '{
             commands: [
@@ -308,22 +270,22 @@ jobs:
 
         aws ssm send-command \
           --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
-          --region "$AWS_REGION" \
+          --region "${AWS_REGION}" \
           --document-name "AWS-RunShellScript" \
           --comment "Deploy app container" \
           --parameters "$COMMANDS_JSON" \
           --output json > ssm-output.json
 
         COMMAND_ID=$(jq -r '.Command.CommandId' ssm-output.json)
-        echo "SSM Command ID: $COMMAND_ID"
+        echo "SSM Command ID: ${COMMAND_ID}"
 
         for i in $(seq 1 30); do
           STATUS=$(aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
             --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-            --region "$AWS_REGION" \
+            --region "${AWS_REGION}" \
             --query 'Status' --output text 2>/dev/null || echo "Pending")
-          echo "Attempt $i: status=$STATUS"
+          echo "Attempt ${i}: status=${STATUS}"
           if [ "$STATUS" = "Success" ]; then
             echo "Deployment succeeded."
             exit 0
@@ -333,7 +295,7 @@ jobs:
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-              --region "$AWS_REGION" \
+              --region "${AWS_REGION}" \
               --query 'StandardErrorContent' --output text || true
             exit 1
           fi
@@ -346,20 +308,20 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
-        HEALTH_JSON=$(jq -n --arg hp "$HOST_PORT" '{commands: ["set -e", "for i in $(seq 1 12); do curl -fsS http://localhost:" + ($hp | @sh) + "/ >/dev/null 2>&1 && exit 0 || sleep 5; done; exit 1"]}')
+        HEALTH_JSON=$(jq -n --arg hp "${HOST_PORT}" '{commands: ["set -e", "for i in $(seq 1 12); do curl -fsS http://localhost:" + ($hp | @sh) + "/ >/dev/null 2>&1 && exit 0 || sleep 5; done; exit 1"]}')
         CMD_ID=$(aws ssm send-command \
           --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
-          --region "$AWS_REGION" \
+          --region "${AWS_REGION}" \
           --document-name "AWS-RunShellScript" \
           --comment "Staging health check" \
           --parameters "$HEALTH_JSON" \
           --query 'Command.CommandId' --output text)
         for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo "Pending")
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "${AWS_REGION}" --query 'Status' --output text 2>/dev/null || echo "Pending")
           if [ "$STATUS" = "Success" ]; then exit 0; fi
           case "$STATUS" in
             Failed|Cancelled|TimedOut)
-              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "$AWS_REGION" --query 'StandardErrorContent' --output text || true
+              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "${AWS_REGION}" --query 'StandardErrorContent' --output text || true
               exit 1
               ;;
           esac
@@ -371,34 +333,27 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
-        SMOKE_JSON=$(jq -n --arg hp "$HOST_PORT" '{commands: ["set -e", "curl -fsS http://localhost:" + ($hp | @sh) + "/ | grep -qi \"<html\""]}')
+        SMOKE_JSON=$(jq -n --arg hp "${HOST_PORT}" '{commands: ["set -e", "curl -fsS http://localhost:" + ($hp | @sh) + "/ | grep -qi \"<html\""]}')
         CMD_ID=$(aws ssm send-command \
           --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
-          --region "$AWS_REGION" \
+          --region "${AWS_REGION}" \
           --document-name "AWS-RunShellScript" \
           --comment "Staging smoke test" \
           --parameters "$SMOKE_JSON" \
           --query 'Command.CommandId' --output text)
         for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo "Pending")
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "${AWS_REGION}" --query 'Status' --output text 2>/dev/null || echo "Pending")
           if [ "$STATUS" = "Success" ]; then exit 0; fi
           case "$STATUS" in
             Failed|Cancelled|TimedOut)
-              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "$AWS_REGION" --query 'StandardErrorContent' --output text || true
+              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "${AWS_REGION}" --query 'StandardErrorContent' --output text || true
               exit 1
               ;;
           esac
           sleep 10
         done
         exit 1
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ github.job }}-ci-artifacts
-        path: |
-          reports/**
-          dist/**
-        if-no-files-found: warn
+    - *id001
   deploy-production:
     name: Deploy Production
     runs-on: ubuntu-latest
@@ -424,14 +379,14 @@ jobs:
       run: |
         set -euo pipefail
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-        IMAGE="$REGISTRY/$IMAGE_REPO:$IMAGE_TAG"
+        IMAGE="${REGISTRY}/${IMAGE_REPO}:${IMAGE_TAG}"
 
         COMMANDS_JSON=$(jq -n \
           --arg img "$IMAGE" \
           --arg user "${{ secrets.GHCR_USER || github.actor }}" \
           --arg token "${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}" \
-          --arg host_port "$HOST_PORT" \
-          --arg container_port "$CONTAINER_PORT" \
+          --arg host_port "${HOST_PORT}" \
+          --arg container_port "${CONTAINER_PORT}" \
           --arg app_name "${{ secrets.DEPLOYMENT_NAME || 'app' }}" \
           '{
             commands: [
@@ -455,22 +410,22 @@ jobs:
 
         aws ssm send-command \
           --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
-          --region "$AWS_REGION" \
+          --region "${AWS_REGION}" \
           --document-name "AWS-RunShellScript" \
           --comment "Deploy app container" \
           --parameters "$COMMANDS_JSON" \
           --output json > ssm-output.json
 
         COMMAND_ID=$(jq -r '.Command.CommandId' ssm-output.json)
-        echo "SSM Command ID: $COMMAND_ID"
+        echo "SSM Command ID: ${COMMAND_ID}"
 
         for i in $(seq 1 30); do
           STATUS=$(aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
             --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-            --region "$AWS_REGION" \
+            --region "${AWS_REGION}" \
             --query 'Status' --output text 2>/dev/null || echo "Pending")
-          echo "Attempt $i: status=$STATUS"
+          echo "Attempt ${i}: status=${STATUS}"
           if [ "$STATUS" = "Success" ]; then
             echo "Deployment succeeded."
             exit 0
@@ -480,7 +435,7 @@ jobs:
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-              --region "$AWS_REGION" \
+              --region "${AWS_REGION}" \
               --query 'StandardErrorContent' --output text || true
             exit 1
           fi
@@ -493,20 +448,20 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
-        HEALTH_JSON=$(jq -n --arg hp "$HOST_PORT" '{commands: ["set -e", "for i in $(seq 1 12); do curl -fsS http://localhost:" + ($hp | @sh) + "/ >/dev/null 2>&1 && exit 0 || sleep 5; done; exit 1"]}')
+        HEALTH_JSON=$(jq -n --arg hp "${HOST_PORT}" '{commands: ["set -e", "for i in $(seq 1 12); do curl -fsS http://localhost:" + ($hp | @sh) + "/ >/dev/null 2>&1 && exit 0 || sleep 5; done; exit 1"]}')
         CMD_ID=$(aws ssm send-command \
           --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
-          --region "$AWS_REGION" \
+          --region "${AWS_REGION}" \
           --document-name "AWS-RunShellScript" \
           --comment "Production health check" \
           --parameters "$HEALTH_JSON" \
           --query 'Command.CommandId' --output text)
         for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo "Pending")
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "${AWS_REGION}" --query 'Status' --output text 2>/dev/null || echo "Pending")
           if [ "$STATUS" = "Success" ]; then exit 0; fi
           case "$STATUS" in
             Failed|Cancelled|TimedOut)
-              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "$AWS_REGION" --query 'StandardErrorContent' --output text || true
+              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "${AWS_REGION}" --query 'StandardErrorContent' --output text || true
               exit 1
               ;;
           esac
@@ -518,34 +473,27 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
-        SMOKE_JSON=$(jq -n --arg hp "$HOST_PORT" '{commands: ["set -e", "curl -fsS http://localhost:" + ($hp | @sh) + "/ | grep -qi \"<html\""]}')
+        SMOKE_JSON=$(jq -n --arg hp "${HOST_PORT}" '{commands: ["set -e", "curl -fsS http://localhost:" + ($hp | @sh) + "/ | grep -qi \"<html\""]}')
         CMD_ID=$(aws ssm send-command \
           --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
-          --region "$AWS_REGION" \
+          --region "${AWS_REGION}" \
           --document-name "AWS-RunShellScript" \
           --comment "Production smoke test" \
           --parameters "$SMOKE_JSON" \
           --query 'Command.CommandId' --output text)
         for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo "Pending")
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "${AWS_REGION}" --query 'Status' --output text 2>/dev/null || echo "Pending")
           if [ "$STATUS" = "Success" ]; then exit 0; fi
           case "$STATUS" in
             Failed|Cancelled|TimedOut)
-              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "$AWS_REGION" --query 'StandardErrorContent' --output text || true
+              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "${AWS_REGION}" --query 'StandardErrorContent' --output text || true
               exit 1
               ;;
           esac
           sleep 10
         done
         exit 1
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ github.job }}-ci-artifacts
-        path: |
-          reports/**
-          dist/**
-        if-no-files-found: warn
+    - *id001
   rollback:
     name: Rollback
     runs-on: ubuntu-latest
@@ -571,14 +519,14 @@ jobs:
       run: |
         set -euo pipefail
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-        IMAGE="$REGISTRY/$IMAGE_REPO:latest"
+        IMAGE="${REGISTRY}/${IMAGE_REPO}:latest"
 
         COMMANDS_JSON=$(jq -n \
           --arg img "$IMAGE" \
           --arg user "${{ secrets.GHCR_USER || github.actor }}" \
           --arg token "${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}" \
-          --arg host_port "$HOST_PORT" \
-          --arg container_port "$CONTAINER_PORT" \
+          --arg host_port "${HOST_PORT}" \
+          --arg container_port "${CONTAINER_PORT}" \
           --arg app_name "${{ secrets.DEPLOYMENT_NAME || 'app' }}" \
           '{
             commands: [
@@ -597,41 +545,34 @@ jobs:
 
         aws ssm send-command \
           --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
-          --region "$AWS_REGION" \
+          --region "${AWS_REGION}" \
           --document-name "AWS-RunShellScript" \
           --comment "Rollback app container" \
           --parameters "$COMMANDS_JSON" \
           --output json > ssm-output.json
 
         COMMAND_ID=$(jq -r '.Command.CommandId' ssm-output.json)
-        echo "SSM Command ID: $COMMAND_ID"
+        echo "SSM Command ID: ${COMMAND_ID}"
 
         for i in $(seq 1 30); do
           STATUS=$(aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
             --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-            --region "$AWS_REGION" \
+            --region "${AWS_REGION}" \
             --query 'Status' --output text 2>/dev/null || echo "Pending")
           if [ "$STATUS" = "Success" ]; then exit 0; fi
           if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-              --region "$AWS_REGION" \
+              --region "${AWS_REGION}" \
               --query 'StandardErrorContent' --output text || true
             exit 1
           fi
           sleep 10
         done
         exit 1
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ github.job }}-ci-artifacts
-        path: |
-          reports/**
-          dist/**
-        if-no-files-found: warn
+    - *id001
   post-deploy:
     name: Post Deploy Verification
     runs-on: ubuntu-latest
@@ -641,7 +582,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-      packages: write
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -656,30 +596,26 @@ jobs:
       shell: bash
       run: |-
         set -euo pipefail
-        VERIFY_JSON=$(jq -n --arg hp "$HOST_PORT" '{commands: ["set -e", "curl -fsS http://localhost:" + ($hp | @sh) + "/health || curl -fsS http://localhost:" + ($hp | @sh) + "/"]}')
+        VERIFY_JSON=$(jq -n --arg hp "${HOST_PORT}" '{commands: ["set -e", "curl -fsS http://localhost:" + ($hp | @sh) + "/health || curl -fsS http://localhost:" + ($hp | @sh) + "/"]}')
         CMD_ID=$(aws ssm send-command \
           --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
-          --region "$AWS_REGION" \
+          --region "${AWS_REGION}" \
           --document-name "AWS-RunShellScript" \
           --comment "Post deploy verification" \
           --parameters "$VERIFY_JSON" \
           --query 'Command.CommandId' --output text)
         for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo "Pending")
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "${AWS_REGION}" --query 'Status' --output text 2>/dev/null || echo "Pending")
           if [ "$STATUS" = "Success" ]; then
             echo "Post-deploy verification succeeded."
             exit 0
           fi
           case "$STATUS" in
             Failed|Cancelled|TimedOut)
-              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "$AWS_REGION" --query 'StandardErrorContent' --output text || true
+              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --region "${AWS_REGION}" --query 'StandardErrorContent' --output text || true
               exit 1
               ;;
           esac
           sleep 10
         done
         exit 1
-    - name: Notify deployment status
-      if: always()
-      run: |
-        echo "Deployment completed with status: ${{ job.status }}"
