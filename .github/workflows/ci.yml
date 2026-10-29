@@ -1,0 +1,411 @@
+name: CI
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+  workflow_dispatch: null
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  REGISTRY: ghcr.io
+  IMAGE_TAG: ${{ github.sha }}
+  AWS_REGION: us-east-1
+  HOST_PORT: '80'
+  CONTAINER_PORT: '8080'
+  ACCESS_URL: http://3.235.58.191
+  PYTHON_VERSION: '3.12'
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+   # - name: Validate repository structure
+   #   if: ${{ env.ACT != 'true' }}
+   #   shell: bash
+  #    run: |
+   #     set -euo pipefail
+    #    test -f Dockerfile || { echo "Dockerfile missing"; exit 1; }
+    #    echo "Dockerfile present"
+    #    test -f .github/workflows/ci.yml || { echo "workflow file missing"; exit 1; }
+   #     echo "Workflow file present"
+   #     echo "Validation complete"
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.job }}-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Build image for tests
+      run: docker build -t ci-test-image:${{ github.sha }} .
+   # - name: Run container smoke test
+    #  if: ${{ env.ACT != 'true' }}
+   #   shell: bash
+   #   run: |
+   #     set -euo pipefail
+    #    mkdir -p test-results
+    #    docker run -d --name ci-test -p 8080:8080 ci-test-image:${{ github.sha }}
+    #    for i in $(seq 1 15); do
+    #      if curl -fsS http://localhost:8080/ >/dev/null 2>&1; then break; fi
+    #      sleep 2
+    #    done
+    #    curl -fsS http://localhost:8080/ | tee test-results/smoke-test.log
+    #    docker stop ci-test
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: test-results/
+        if-no-files-found: ignore
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.job }}-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+   # - name: Run Gitleaks secret scan
+    #  if: ${{ env.ACT != 'true' }}
+   #   uses: gitleaks/gitleaks-action@v2
+   #   env:
+   #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+   # - name: Scan filesystem dependencies with Trivy
+   #   if: ${{ env.ACT != 'true' }}
+   #   uses: aquasecurity/trivy-action@v0.36.0
+    #  with:
+   #     scan-type: fs
+    #    scanners: vuln
+    #    severity: HIGH,CRITICAL
+    #    exit-code: '1'
+    #    format: table
+    #- name: Scan configuration/misconfiguration with Trivy
+   #   if: ${{ env.ACT != 'true' }}
+   #   uses: aquasecurity/trivy-action@v0.36.0
+   #   with:
+   #     scan-type: fs
+   #     scanners: misconfig
+   #     severity: HIGH,CRITICAL
+   #     exit-code: '1'
+    #    format: table
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - validate
+    - test
+    - security
+   # if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Compute image name
+      id: image
+      shell: bash
+      run: |
+        set -euo pipefail
+        IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+        echo "repo=$IMAGE_REPO" >> "$GITHUB_OUTPUT"
+        echo "image=${{ env.REGISTRY }}/$IMAGE_REPO:${{ env.IMAGE_TAG }}" >> "$GITHUB_OUTPUT"
+    - name: Build Docker image
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker build \
+          -t "${{ steps.image.outputs.image }}" \
+          -t "${{ env.REGISTRY }}/${{ steps.image.outputs.repo }}:latest" \
+          .
+   # - name: Scan built image with Trivy
+   #   uses: aquasecurity/trivy-action@v0.36.0
+   #   with:
+   #     image-ref: ${{ steps.image.outputs.image }}
+    #    format: table
+   #     exit-code: '1'
+   #     severity: CRITICAL,HIGH
+   #     output: trivy-image-report.txt
+    - name: Upload build artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: trivy-image-report.txt
+        if-no-files-found: ignore
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.job }}-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - build
+  #  if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Log in to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build and push image
+      shell: bash
+      run: |
+        set -euo pipefail
+        IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+        IMAGE="${{ env.REGISTRY }}/$IMAGE_REPO"
+        docker build -t "$IMAGE:${{ env.IMAGE_TAG }}" -t "$IMAGE:latest" .
+        docker push "$IMAGE:${{ env.IMAGE_TAG }}"
+        docker push "$IMAGE:latest"
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.job }}-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - publish
+    #if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Deploy to EC2 via SSM
+      if: ${{ env.ACT != 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+        IMAGE="${{ env.REGISTRY }}/$IMAGE_REPO:${{ env.IMAGE_TAG }}"
+
+        COMMANDS_JSON=$(jq -n \
+          --arg img "$IMAGE" \
+          --arg user "${{ secrets.GHCR_USER || github.actor }}" \
+          --arg token "${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}" \
+          --arg host_port "${{ env.HOST_PORT }}" \
+          --arg container_port "${{ env.CONTAINER_PORT }}" \
+          --arg app_name "${{ secrets.DEPLOYMENT_NAME || 'app' }}" \
+          '{
+            commands: [
+              "set -e",
+              "if ! command -v docker >/dev/null 2>&1; then if command -v dnf >/dev/null 2>&1; then dnf install -y docker; elif command -v yum >/dev/null 2>&1; then yum install -y docker; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io; else echo \"No supported package manager found\"; exit 1; fi; fi; systemctl enable --now docker || service docker start",
+              "for i in $(seq 1 15); do docker info >/dev/null 2>&1 && break || sleep 1; done",
+              "docker info >/dev/null 2>&1",
+              ("echo " + ($token | @sh) + " | docker login ghcr.io -u " + ($user | @sh) + " --password-stdin"),
+              ("docker pull " + ($img | @sh)),
+              ("docker rm -f " + ($app_name | @sh) + "-new 2>/dev/null || true"),
+              ("docker run -d --name " + ($app_name | @sh) + "-new -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh)),
+              ("for i in $(seq 1 30); do if command -v curl >/dev/null 2>&1; then curl -fsS http://localhost:" + $host_port + "/ >/dev/null 2>&1 && break; else wget -qO- http://localhost:" + $host_port + "/ >/dev/null 2>&1 && break; fi; sleep 2; done"),
+              ("if command -v curl >/dev/null 2>&1; then curl -fsS http://localhost:" + $host_port + "/ >/dev/null 2>&1; else wget -qO- http://localhost:" + $host_port + "/ >/dev/null 2>&1; fi"),
+              ("docker stop " + ($app_name | @sh) + " 2>/dev/null || true"),
+              ("docker rm " + ($app_name | @sh) + " 2>/dev/null || true"),
+              ("docker rename " + ($app_name | @sh) + "-new " + ($app_name | @sh)),
+              "docker image prune -f || true"
+            ]
+          }')
+
+        aws ssm send-command \
+          --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+          --region "${{ env.AWS_REGION }}" \
+          --document-name "AWS-RunShellScript" \
+          --comment "Deploy app container" \
+          --parameters "$COMMANDS_JSON" \
+          --output json > ssm-output.json
+
+        COMMAND_ID=$(jq -r '.Command.CommandId' ssm-output.json)
+        echo "SSM Command ID: $COMMAND_ID"
+
+        for i in $(seq 1 30); do
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query 'Status' --output text 2>/dev/null || echo "Pending")
+          echo "Attempt $i: $STATUS"
+          case "$STATUS" in
+            Success) exit 0 ;;
+            Failed|Cancelled|TimedOut)
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+                --region "${{ env.AWS_REGION }}" \
+                --query 'StandardErrorContent' --output text || true
+              exit 1 ;;
+          esac
+          sleep 10
+        done
+        echo "Timed out waiting for SSM command"
+        exit 1
+    - name: Health check
+      if: ${{ env.ACT != 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fsS --retry 10 --retry-delay 5 --retry-connrefused "${{ env.ACCESS_URL }}/"
+    - name: Smoke test
+      if: ${{ env.ACT != 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fsS -o /dev/null -w "%{http_code}\n" "${{ env.ACCESS_URL }}/"
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.job }}-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  rollback:
+    name: Rollback
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - deploy
+   # if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Rollback via SSM
+      if: ${{ env.ACT != 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+        IMAGE="${{ env.REGISTRY }}/$IMAGE_REPO:${{ env.IMAGE_TAG }}"
+
+        COMMANDS_JSON=$(jq -n \
+          --arg img "$IMAGE" \
+          --arg user "${{ secrets.GHCR_USER || github.actor }}" \
+          --arg token "${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}" \
+          --arg host_port "${{ env.HOST_PORT }}" \
+          --arg container_port "${{ env.CONTAINER_PORT }}" \
+          --arg app_name "${{ secrets.DEPLOYMENT_NAME || 'app' }}" \
+          '{
+            commands: [
+              "set -e",
+              "if ! command -v docker >/dev/null 2>&1; then if command -v dnf >/dev/null 2>&1; then dnf install -y docker; elif command -v yum >/dev/null 2>&1; then yum install -y docker; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io; else echo \"No supported package manager found\"; exit 1; fi; fi; systemctl enable --now docker || service docker start",
+              "for i in $(seq 1 15); do docker info >/dev/null 2>&1 && break || sleep 1; done",
+              "docker info >/dev/null 2>&1",
+              ("echo " + ($token | @sh) + " | docker login ghcr.io -u " + ($user | @sh) + " --password-stdin"),
+              ("docker pull " + ($img | @sh)),
+              ("docker stop " + ($app_name | @sh) + " 2>/dev/null || true"),
+              ("docker rm " + ($app_name | @sh) + " 2>/dev/null || true"),
+              ("docker run -d --name " + ($app_name | @sh) + " --restart unless-stopped -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh)),
+              "docker image prune -f || true"
+            ]
+          }')
+
+        aws ssm send-command \
+          --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+          --region "${{ env.AWS_REGION }}" \
+          --document-name "AWS-RunShellScript" \
+          --comment "Rollback app container" \
+          --parameters "$COMMANDS_JSON" \
+          --output json > ssm-rollback-output.json
+
+        COMMAND_ID=$(jq -r '.Command.CommandId' ssm-rollback-output.json)
+        echo "SSM Rollback Command ID: $COMMAND_ID"
+
+        for i in $(seq 1 30); do
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query 'Status' --output text 2>/dev/null || echo "Pending")
+          echo "Attempt $i: $STATUS"
+          case "$STATUS" in
+            Success) exit 0 ;;
+            Failed|Cancelled|TimedOut)
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+                --region "${{ env.AWS_REGION }}" \
+                --query 'StandardErrorContent' --output text || true
+              exit 1 ;;
+          esac
+          sleep 10
+        done
+        echo "Timed out waiting for SSM rollback command"
+        exit 1
+  post-deploy:
+    name: Post Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - deploy
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+    - name: Post-deploy verification
+      if: ${{ env.ACT != 'true' }}
+      shell: bash
+      run: |-
+        set -euo pipefail
+        curl -fsS -o /dev/null -w "%{http_code}\n" "${{ env.ACCESS_URL }}/"
