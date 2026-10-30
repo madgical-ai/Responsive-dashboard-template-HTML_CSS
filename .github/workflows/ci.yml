@@ -278,7 +278,7 @@ jobs:
 
               "docker rm -f \"$NEW\"",
 
-              ("echo 'Cleaning up port " + $host_port + "'; docker ps -q --filter " + ("publish=" + $host_port | @sh) + " | xargs -r docker rm -f; if command -v fuser >/dev/null 2>&1; then fuser -k " + ($host_port + "/tcp" | @sh) + " 2>/dev/null || true; fi; sleep 2"),
+              ("echo 'Cleaning port ' " + ($host_port | @sh) + "; docker ps -q --filter " + ("publish=" + $host_port | @sh) + " | xargs -r docker rm -f; if command -v fuser >/dev/null 2>&1; then fuser -k " + ($host_port + "/tcp" | @sh) + " 2>/dev/null || true; fi; sleep 2"),
 
               ("docker run -d --name \"$APP\" --restart unless-stopped -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh) + " || { docker start \"$OLD\" 2>/dev/null || true; exit 1; }"),
 
