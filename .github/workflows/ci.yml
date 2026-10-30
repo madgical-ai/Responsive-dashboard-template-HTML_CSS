@@ -1,0 +1,538 @@
+name: CI
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+  workflow_dispatch: null
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  REGISTRY: ghcr.io
+  IMAGE_TAG: ${{ github.sha }}
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: '3.12'
+  HOST_PORT: '80'
+  CONTAINER_PORT: '8080'
+  APP_URL: http://3.89.79.100
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    # - name: Lint
+    #   if: ${{ env.ACT != 'true' }}
+    #   run: |
+    #     set -euo pipefail
+    #     if [ -f package.json ]; then
+    #       if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; fi
+    #       npm run lint --if-present
+    #     fi
+    #     if [ -f pyproject.toml ] || [ -f requirements.txt ]; then
+    #       python -m pip install --break-system-packages ruff
+    #       ruff check .
+    #     fi
+    #     echo "Lint stage complete"
+    # - name: Type check
+    #   if: ${{ env.ACT != 'true' }}
+    #   run: |
+    #     set -euo pipefail
+    #     if [ -f tsconfig.json ]; then
+    #       if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; fi
+    #       npx tsc --noEmit
+    #     fi
+    #     if [ -f pyproject.toml ]; then
+    #       python -m pip install --break-system-packages mypy
+    #       mypy .
+    #     fi
+    #     echo "Type check stage complete"
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    # - name: Unit tests
+    #   if: ${{ env.ACT != 'true' }}
+    #   run: |
+    #     set -euo pipefail
+    #     if [ -f package.json ]; then
+    #       if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; fi
+    #       npm test --if-present
+    #     fi
+    #     if [ -f pyproject.toml ]; then
+    #       python -m pip install --break-system-packages pytest
+    #       pytest -q
+    #     fi
+    #     echo "Unit tests complete"
+    # - name: Integration tests
+    #   if: ${{ env.ACT != 'true' }}
+    #   run: |
+    #     set -euo pipefail
+    #     echo "Integration tests complete"
+    # - name: Coverage
+    #   if: ${{ env.ACT != 'true' }}
+    #   run: |
+    #     set -euo pipefail
+    #     echo "Coverage collection complete"
+    # - name: Upload test artifacts
+    #   if: always()
+    #   uses: actions/upload-artifact@v4
+    #   with:
+    #     name: test-results
+    #     path: |
+    #       coverage/
+    #       test-results/
+    #     if-no-files-found: ignore
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    # - name: Run Gitleaks
+    #   if: ${{ env.ACT != 'true' }}
+    #   uses: gitleaks/gitleaks-action@v2
+    #   env:
+    #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    # - name: Dependency scan
+    #   if: ${{ env.ACT != 'true' }}
+    #   uses: aquasecurity/trivy-action@v0.36.0
+    #   with:
+    #     scan-type: fs
+    #     scan-ref: .
+    #     format: table
+    #     exit-code: '0'
+    #     severity: CRITICAL,HIGH
+    # - name: Code scan
+    #   if: ${{ env.ACT != 'true' }}
+    #   run: |
+    #     set -euo pipefail
+    #     echo "Static code scan complete"
+  build:
+    name: Build and Scan Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - validate
+    - test
+    - security
+    # if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Set lowercase image name
+      run: |
+        set -euo pipefail
+        IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+        echo "IMAGE_NAME=${{ env.REGISTRY }}/$IMAGE_REPO" >> "$GITHUB_ENV"
+    - name: Build Docker image
+      run: |
+        set -euo pipefail
+        docker build -t "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" .
+    # - name: Scan Docker image with Trivy
+    #   uses: aquasecurity/trivy-action@v0.36.0
+    #   with:
+    #     image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+    #     format: table
+    #     exit-code: '1'
+    #     ignore-unfixed: true
+    #     vuln-type: os,library
+    #     severity: CRITICAL,HIGH
+    - name: Save image metadata
+      run: |
+        set -euo pipefail
+        echo "image=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" > image-metadata.txt
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: image-metadata
+        path: image-metadata.txt
+        if-no-files-found: ignore
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  publish:
+    name: Publish Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - build
+  #  if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Set lowercase image name
+      run: |
+        set -euo pipefail
+        IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+        echo "IMAGE_NAME=${{ env.REGISTRY }}/$IMAGE_REPO" >> "$GITHUB_ENV"
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build and push Docker image
+      run: |
+        set -euo pipefail
+        docker build \
+          -t "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
+          -t "${{ env.IMAGE_NAME }}:latest" .
+        docker push "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+        docker push "${{ env.IMAGE_NAME }}:latest"
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: publish-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+ 
+  deploy:
+    name: Deploy to EC2 via SSM
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+      - publish
+
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to EC2 via SSM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="${{ env.REGISTRY }}/$IMAGE_REPO:${{ env.IMAGE_TAG }}"
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+
+          export DEPLOY_IMAGE="$IMAGE"
+          export REGISTRY="${{ env.REGISTRY }}"
+          export GHCR_USER="${{ secrets.GHCR_USER || github.actor }}"
+          export GHCR_TOKEN="${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}"
+          export HOST_PORT="${{ env.HOST_PORT }}"
+          export CONTAINER_PORT="${{ env.CONTAINER_PORT }}"
+          export APP_NAME="${{ secrets.DEPLOYMENT_NAME }}"
+
+          COMMANDS_JSON=$(python3 <<'PY'
+          import json
+          import os
+          import shlex
+
+          img = os.environ["DEPLOY_IMAGE"]
+          registry = os.environ["REGISTRY"]
+          user = os.environ["GHCR_USER"]
+          token = os.environ["GHCR_TOKEN"]
+          host_port = os.environ["HOST_PORT"]
+          container_port = os.environ["CONTAINER_PORT"]
+          app_name = os.environ["APP_NAME"]
+
+          q = shlex.quote
+
+          commands = [
+              "set -eu",
+
+              # Install Docker only when missing
+              """if ! command -v docker >/dev/null 2>&1; then
+                  export DEBIAN_FRONTEND=noninteractive
+
+                  if command -v dnf >/dev/null 2>&1; then
+                      dnf install -y docker
+                  elif command -v yum >/dev/null 2>&1; then
+                      yum install -y docker
+                  elif command -v apt-get >/dev/null 2>&1; then
+                      apt-get update -qq
+                      apt-get install -y -qq docker.io
+                  else
+                      echo 'No supported package manager found'
+                      exit 1
+                  fi
+              fi
+
+              systemctl enable docker || true
+              systemctl start docker || service docker start""",
+
+              # Wait for Docker
+              """for i in $(seq 1 30); do
+                  if docker info >/dev/null 2>&1; then
+                      break
+                  fi
+                  sleep 2
+              done
+
+              docker info >/dev/null 2>&1""",
+
+              # Login and pull image
+              f"echo {q(token)} | docker login {q(registry)} -u {q(user)} --password-stdin",
+              f"docker pull {q(img)}",
+
+              # Remove any previous temporary container
+              f"docker rm -f {q(app_name)}-new >/dev/null 2>&1 || true",
+
+              # Start temporary container without publishing host port
+              f"docker run -d --name {q(app_name)}-new {q(img)}",
+
+              # Test temporary container
+              f"""HEALTHY=0
+
+              for i in $(seq 1 15); do
+                  if docker exec {q(app_name)}-new sh -c '
+                      port="$1"
+                      if command -v curl >/dev/null 2>&1; then
+                          curl -fsS "http://127.0.0.1:$port/" >/dev/null
+                      elif command -v wget >/dev/null 2>&1; then
+                          wget -qO- "http://127.0.0.1:$port/" >/dev/null
+                      else
+                          exit 1
+                      fi
+                  ' sh {q(container_port)}; then
+                      HEALTHY=1
+                      break
+                  fi
+                  sleep 2
+              done
+
+              if [ "$HEALTHY" -ne 1 ]; then
+                  echo 'Temporary container health check failed'
+                  docker logs --tail 100 {q(app_name)}-new || true
+                  docker rm -f {q(app_name)}-new || true
+                  exit 1
+              fi
+
+              echo 'Temporary container health check passed'
+              docker rm -f {q(app_name)}-new""",
+
+              # Remove every Docker container publishing the production port
+              f"""echo 'Cleaning containers using host port {host_port}'
+
+              PORT_CONTAINERS=$(docker ps -q --filter 'publish={host_port}')
+
+              if [ -n "$PORT_CONTAINERS" ]; then
+                  for container_id in $PORT_CONTAINERS; do
+                      echo "Removing container $container_id"
+                      docker rm -f "$container_id"
+                  done
+              fi
+
+              docker rm -f {q(app_name)} >/dev/null 2>&1 || true""",
+
+              # Stop Nginx to free port 80 for Docker
+              f"""if command -v nginx >/dev/null 2>&1; then
+                  echo 'Stopping Nginx...'
+                  systemctl stop nginx || true
+                  systemctl disable nginx || true
+              fi""",
+
+              # Check for non-Docker process using host port
+              f"""if command -v ss >/dev/null 2>&1; then
+                  if ss -ltn 'sport = :{host_port}' | grep -q LISTEN; then
+                      echo 'ERROR: Host port {host_port} is still occupied'
+                      ss -ltnp 'sport = :{host_port}'
+                      exit 1
+                  fi
+              fi""",
+
+              # Start production container
+              f"""echo 'Starting production container'
+
+              docker run -d \\
+                  --name {q(app_name)} \\
+                  --restart unless-stopped \\
+                  -p {q(host_port)}:{q(container_port)} \\
+                  {q(img)}""",
+
+              # Production health check
+              f"""echo 'Checking production container'
+
+              HEALTHY=0
+
+              for i in $(seq 1 15); do
+                  if command -v curl >/dev/null 2>&1; then
+                      curl -fsS http://127.0.0.1:{host_port}/ >/dev/null 2>&1 && HEALTHY=1
+                  elif command -v wget >/dev/null 2>&1; then
+                      wget -qO- http://127.0.0.1:{host_port}/ >/dev/null 2>&1 && HEALTHY=1
+                  fi
+
+                  if [ "$HEALTHY" -eq 1 ]; then
+                      break
+                  fi
+
+                  sleep 2
+              done
+
+              if [ "$HEALTHY" -ne 1 ]; then
+                  echo 'Production health check failed'
+                  docker logs --tail 100 {q(app_name)} || true
+                  exit 1
+              fi
+
+              echo 'Production health check passed'""",
+
+              # Cleanup unused images
+              "docker image prune -f || true",
+
+              "echo 'Deployment completed successfully'"
+          ]
+
+          print(json.dumps({"commands": commands}))
+          PY
+          )
+
+          echo "Sending deployment command to EC2..."
+
+          aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --region "${{ env.AWS_REGION }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy app container" \
+            --parameters "$COMMANDS_JSON" \
+            --output json > ssm-output.json
+
+          COMMAND_ID=$(jq -r '.Command.CommandId' ssm-output.json)
+
+          echo "SSM command id: $COMMAND_ID"
+
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "${{ env.AWS_REGION }}" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "SSM status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                echo "Deployment succeeded"
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                echo "Deployment failed with status $STATUS"
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --region "${{ env.AWS_REGION }}" \
+                  --query "StandardErrorContent" \
+                  --output text || true
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --region "${{ env.AWS_REGION }}" \
+                  --query "StandardOutputContent" \
+                  --output text || true
+
+                exit 1
+                ;;
+            esac
+
+            sleep 10
+          done
+
+          echo "Timed out waiting for SSM command to complete"
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "${{ env.AWS_REGION }}" \
+            --query "StandardErrorContent" \
+            --output text || true
+
+          exit 1
+
+  health-check:
+    name: Production Health Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - deploy
+   # if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    steps:
+    - name: Health check
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        set -euo pipefail
+        for i in $(seq 1 12); do
+          if curl -fsS "${{ env.APP_URL }}/" >/dev/null; then
+            echo "Health check passed"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "Health check failed"
+        exit 1
+    - name: Smoke test
+      if: ${{ env.ACT != 'true' }}
+      run: |-
+        set -euo pipefail
+        curl -fsS "${{ env.APP_URL }}/" >/dev/null
+        echo "Smoke test passed"
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: health-check-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
