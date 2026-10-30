@@ -231,37 +231,38 @@ jobs:
           reports/**
           dist/**
         if-no-files-found: warn
+ 
   deploy:
     name: Deploy to EC2 via SSM
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs:
       - publish
-  
+
     permissions:
       id-token: write
       contents: read
       packages: write
-  
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-  
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-  
+
       - name: Deploy to EC2 via SSM
         shell: bash
         run: |
           set -euo pipefail
-  
+
           IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           IMAGE="${{ env.REGISTRY }}/$IMAGE_REPO:${{ env.IMAGE_TAG }}"
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
-  
+
           export DEPLOY_IMAGE="$IMAGE"
           export REGISTRY="${{ env.REGISTRY }}"
           export GHCR_USER="${{ secrets.GHCR_USER || github.actor }}"
@@ -269,12 +270,12 @@ jobs:
           export HOST_PORT="${{ env.HOST_PORT }}"
           export CONTAINER_PORT="${{ env.CONTAINER_PORT }}"
           export APP_NAME="${{ secrets.DEPLOYMENT_NAME }}"
-  
+
           COMMANDS_JSON=$(python3 <<'PY'
           import json
           import os
           import shlex
-  
+
           img = os.environ["DEPLOY_IMAGE"]
           registry = os.environ["REGISTRY"]
           user = os.environ["GHCR_USER"]
@@ -282,80 +283,153 @@ jobs:
           host_port = os.environ["HOST_PORT"]
           container_port = os.environ["CONTAINER_PORT"]
           app_name = os.environ["APP_NAME"]
-  
+
           q = shlex.quote
-  
+
           commands = [
               "set -eu",
-  
+
+              # Install Docker only when missing
               """if ! command -v docker >/dev/null 2>&1; then
-              if command -v dnf >/dev/null 2>&1; then
-                  dnf install -y docker
-              elif command -v yum >/dev/null 2>&1; then
-                  yum install -y docker
-              elif command -v apt-get >/dev/null 2>&1; then
-                  apt-get update && apt-get install -y docker.io
-              else
-                  echo 'No supported package manager found'
+                  export DEBIAN_FRONTEND=noninteractive
+
+                  if command -v dnf >/dev/null 2>&1; then
+                      dnf install -y docker
+                  elif command -v yum >/dev/null 2>&1; then
+                      yum install -y docker
+                  elif command -v apt-get >/dev/null 2>&1; then
+                      apt-get update -qq
+                      apt-get install -y -qq docker.io
+                  else
+                      echo 'No supported package manager found'
+                      exit 1
+                  fi
+              fi
+
+              systemctl enable docker || true
+              systemctl start docker || service docker start""",
+
+              # Wait for Docker
+              """for i in $(seq 1 30); do
+                  if docker info >/dev/null 2>&1; then
+                      break
+                  fi
+                  sleep 2
+              done
+
+              docker info >/dev/null 2>&1""",
+
+              # Login and pull image
+              f"echo {q(token)} | docker login {q(registry)} -u {q(user)} --password-stdin",
+              f"docker pull {q(img)}",
+
+              # Remove any previous temporary container
+              f"docker rm -f {q(app_name)}-new >/dev/null 2>&1 || true",
+
+              # Start temporary container without publishing host port
+              f"docker run -d --name {q(app_name)}-new {q(img)}",
+
+              # Test temporary container
+              f"""HEALTHY=0
+
+              for i in $(seq 1 15); do
+                  if docker exec {q(app_name)}-new sh -c '
+                      port="$1"
+                      if command -v curl >/dev/null 2>&1; then
+                          curl -fsS "http://127.0.0.1:$port/" >/dev/null
+                      elif command -v wget >/dev/null 2>&1; then
+                          wget -qO- "http://127.0.0.1:$port/" >/dev/null
+                      else
+                          exit 1
+                      fi
+                  ' sh {q(container_port)}; then
+                      HEALTHY=1
+                      break
+                  fi
+                  sleep 2
+              done
+
+              if [ "$HEALTHY" -ne 1 ]; then
+                  echo 'Temporary container health check failed'
+                  docker logs --tail 100 {q(app_name)}-new || true
+                  docker rm -f {q(app_name)}-new || true
                   exit 1
               fi
+
+              echo 'Temporary container health check passed'
+              docker rm -f {q(app_name)}-new""",
+
+              # Remove every Docker container publishing the production port
+              f"""echo 'Cleaning containers using host port {host_port}'
+
+              PORT_CONTAINERS=$(docker ps -q --filter 'publish={host_port}')
+
+              if [ -n "$PORT_CONTAINERS" ]; then
+                  for container_id in $PORT_CONTAINERS; do
+                      echo "Removing container $container_id"
+                      docker rm -f "$container_id"
+                  done
               fi
-              systemctl enable --now docker || service docker start""",
-  
-              """for i in $(seq 1 15); do
-                  docker info >/dev/null 2>&1 && break
-                  sleep 1
-              done
-              docker info >/dev/null 2>&1""",
-  
-              f"echo {q(token)} | docker login {q(registry)} -u {q(user)} --password-stdin",
-  
-              f"docker pull {q(img)}",
-  
-              f"docker rm -f {q(app_name)}-new 2>/dev/null || true",
-  
-              f"docker run -d --name {q(app_name)}-new {q(img)}",
-  
-              f"""docker exec {q(app_name)}-new sh -c 'port="$1";
+
+              docker rm -f {q(app_name)} >/dev/null 2>&1 || true""",
+
+              # Check for non-Docker process using host port
+              f"""if command -v ss >/dev/null 2>&1; then
+                  if ss -ltn 'sport = :{host_port}' | grep -q LISTEN; then
+                      echo 'ERROR: Host port {host_port} is still occupied'
+                      ss -ltnp 'sport = :{host_port}'
+                      exit 1
+                  fi
+              fi""",
+
+              # Start production container
+              f"""echo 'Starting production container'
+
+              docker run -d \\
+                  --name {q(app_name)} \\
+                  --restart unless-stopped \\
+                  -p {q(host_port)}:{q(container_port)} \\
+                  {q(img)}""",
+
+              # Production health check
+              f"""echo 'Checking production container'
+
+              HEALTHY=0
+
               for i in $(seq 1 15); do
                   if command -v curl >/dev/null 2>&1; then
-                      curl -fsS "http://127.0.0.1:$port/" >/dev/null 2>&1 && exit 0
+                      curl -fsS http://127.0.0.1:{host_port}/ >/dev/null 2>&1 && HEALTHY=1
                   elif command -v wget >/dev/null 2>&1; then
-                      wget -qO- "http://127.0.0.1:$port/" >/dev/null 2>&1 && exit 0
+                      wget -qO- http://127.0.0.1:{host_port}/ >/dev/null 2>&1 && HEALTHY=1
                   fi
+
+                  if [ "$HEALTHY" -eq 1 ]; then
+                      break
+                  fi
+
                   sleep 2
               done
-              exit 1' sh {q(container_port)}""",
-  
-              f"docker stop {q(app_name)} 2>/dev/null || true",
-              f"docker rm {q(app_name)} 2>/dev/null || true",
-              f"docker rm -f {q(app_name)}-new 2>/dev/null || true",
-  
-              f"docker run -d --name {q(app_name)} -p {q(host_port)}:{q(container_port)} --restart unless-stopped {q(img)}",
-  
-              f"""for i in $(seq 1 15); do
-                  if command -v curl >/dev/null 2>&1; then
-                      curl -fsS http://127.0.0.1:{host_port}/ >/dev/null 2>&1 && exit 0
-                  elif command -v wget >/dev/null 2>&1; then
-                      wget -qO- http://127.0.0.1:{host_port}/ >/dev/null 2>&1 && exit 0
-                  fi
-                  sleep 2
-              done
-              echo 'Production health check failed'
-              docker logs --tail 100 {q(app_name)}
-              exit 1""",
-  
-              "docker image prune -f || true"
+
+              if [ "$HEALTHY" -ne 1 ]; then
+                  echo 'Production health check failed'
+                  docker logs --tail 100 {q(app_name)} || true
+                  exit 1
+              fi
+
+              echo 'Production health check passed'""",
+
+              # Cleanup unused images
+              "docker image prune -f || true",
+
+              "echo 'Deployment completed successfully'"
           ]
-  
+
           print(json.dumps({"commands": commands}))
           PY
           )
-  
+
           echo "Sending deployment command to EC2..."
-  
-          printf '%s' "$COMMANDS_JSON" > ssm-params.json
-  
+
           aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --region "${{ env.AWS_REGION }}" \
@@ -363,11 +437,11 @@ jobs:
             --comment "Deploy app container" \
             --parameters "$COMMANDS_JSON" \
             --output json > ssm-output.json
-  
+
           COMMAND_ID=$(jq -r '.Command.CommandId' ssm-output.json)
-  
+
           echo "SSM command id: $COMMAND_ID"
-  
+
           for i in $(seq 1 30); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
@@ -375,9 +449,9 @@ jobs:
               --region "${{ env.AWS_REGION }}" \
               --query "Status" \
               --output text 2>/dev/null || echo "Pending")
-  
+
             echo "SSM status: $STATUS"
-  
+
             case "$STATUS" in
               Success)
                 echo "Deployment succeeded"
@@ -385,38 +459,39 @@ jobs:
                 ;;
               Failed|Cancelled|TimedOut)
                 echo "Deployment failed with status $STATUS"
-  
+
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$INSTANCE_ID" \
                   --region "${{ env.AWS_REGION }}" \
                   --query "StandardErrorContent" \
                   --output text || true
-  
+
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$INSTANCE_ID" \
                   --region "${{ env.AWS_REGION }}" \
                   --query "StandardOutputContent" \
                   --output text || true
-  
+
                 exit 1
                 ;;
             esac
-  
+
             sleep 10
           done
-  
+
           echo "Timed out waiting for SSM command to complete"
-  
+
           aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
             --instance-id "$INSTANCE_ID" \
             --region "${{ env.AWS_REGION }}" \
             --query "StandardErrorContent" \
             --output text || true
-  
+
           exit 1
+
   health-check:
     name: Production Health Check
     runs-on: ubuntu-latest
