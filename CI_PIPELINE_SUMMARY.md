@@ -1,78 +1,94 @@
 # CI/CD Pipeline Walkthrough
 
-This pipeline takes a commit from `main` through security scanning, testing, container build, and staged ECS deployment with manual production approval and rollback safety nets.
+This repository ships a container image to Amazon ECR and runs it on ECS Fargate, with a staging gate before production. The workflow lives in `.github/workflows/` and is named **CI/CD Pipeline**.
 
 ## Prerequisites
 
-Before CI can run, the project and AWS environment must provide:
+### Application runtime & container
+- **Base image:** `nginxinc/nginx-unprivileged:1.27-alpine` (non-root, unprivileged nginx).
+- **Exposed port:** `80` (container listens on 80; the unprivileged image does not require root).
+- **Entrypoint:** `CMD ["nginx", "-g", "daemon off;"]` — the container must stay in the foreground.
+- **Dockerfile location:** repository root (`./Dockerfile`). The `validate` job fails the build if it is missing.
+- **Build args:** none declared. If you add any, wire them into both the `test` and `build` `docker build` invocations.
 
-- **Runtime**: Node.js 20 (installed via `actions/setup-node`); `npm ci` requires a committed `package-lock.json`.
-- **Docker base image**: `nginx:alpine` (from `Dockerfile`).
-- **System packages in image**: `curl` (installed in the Dockerfile).
-- **Exposed port**: `80` (container listens on 80; workflow maps `HOST_PORT=80` → `CONTAINER_PORT=80`).
-- **Entrypoint**: `nginx -g 'daemon off;'` serving static content from `/usr/share/nginx/html`.
-- **Runner**: `ubuntu-latest` with Docker/Buildx available.
-- **Required GitHub secrets**:
-  - `AWS_REGION` — AWS region for all operations
-  - `AWS_DEPLOY_ROLE_ARN` — IAM role assumed via OIDC (`id-token: write` permission)
-  - `ECR_REPOSITORY_URL` — target ECR repository
-  - `ECS_CLUSTER_NAME`, `ECS_SERVICE_NAME`, `ECS_TASK_FAMILY`, `CONTAINER_NAME` — ECS deployment targets
-  - `PRODUCTION_APPROVERS` — GitHub usernames allowed to approve production deploys
-- **AWS side**: An existing ECS cluster/service/task definition, an ECR repo, and an IAM deploy role trusting GitHub OIDC.
-- **Tools installed in-flight**: Trivy, gitleaks v8.18.4, `jq` (preinstalled on runners).
+### Environment variables
+- `NGINX_PORT` — set in the Dockerfile; the image must serve on port 80 to match the workflow's port mapping.
+- Workflow-level: `IMAGE_TAG` (`github.sha`), `AWS_REGION` (`us-east-1`), `HEALTHCHECK_PATH` (`/`), `HOST_PORT` (`80`), `CONTAINER_PORT` (`80`).
+- `ACT` — when set to `true` (local `act` runs), steps that need Docker networking or a live ALB are skipped.
 
-## Pipeline Flow
+### Runner requirements
+- `ubuntu-latest` GitHub-hosted runners with Docker, Docker Buildx, `bash`, `curl`, `jq`, and `find` available.
+- No self-hosted runner labels are used.
+
+### Required secrets
+| Secret | Used by |
+| --- | --- |
+| `ECR_REPOSITORY_URL` | build, publish, deploy |
+| `AWS_DEPLOY_ROLE_ARN` | publish, deploy, rollback (OIDC assume-role) |
+| `ECS_TASK_FAMILY` | deploy, rollback |
+| `CONTAINER_NAME` | deploy (container to re-image in the task definition) |
+| `ECS_SERVICE_NAME`, `ECS_CLUSTER_NAME` | deploy, rollback |
+| `ALB_DNS_NAME` | staging/production health + smoke tests |
+| `GITHUB_TOKEN` | Gitleaks secret scan (provided automatically) |
+
+### AWS & GitHub configuration
+- An **ECR repository** matching `ECR_REPOSITORY_URL`.
+- An **ECS Fargate cluster and service**, plus an **ALB** whose DNS name is reachable from GitHub runners.
+- An **IAM OIDC provider** for GitHub Actions and a deploy role trusting this repository (`id-token: write` is granted to publish/deploy/rollback).
+- GitHub **environments** named `staging` and `production` (add protection rules/reviewers as needed).
+- A repository language supported by CodeQL — currently configured as `javascript-typescript`.
+
+## Pipeline stages
+
+### 1. Quality gate (runs on every PR and push)
+- **`validate`** — checks out the repo, asserts `Dockerfile` exists, and runs `bash -n` over every `*.sh` file to catch shell syntax errors. Uploads `reports/**` and `dist/**` if present.
+- **`test`** — builds the image as `ci-test-image:<sha>`, runs it detached on host port `8080` → container port `80`, then polls `http://localhost:8080/` for up to 30 seconds. On failure it dumps container logs. The container is always removed, and a `test-report.txt` artifact is uploaded.
+
+### 2. Security gate (runs in parallel with the quality gate)
+- **`security-dependency-scan`** — Trivy filesystem scan of the repo; fails on `CRITICAL` or `HIGH` findings.
+- **`security-secret-scan`** — Gitleaks over full history (`fetch-depth: 0`) with `--verbose --redact`.
+- **`security-code-scan`** — CodeQL init + analyze for `javascript-typescript`, uploading results to GitHub code scanning (`security-events: write`).
+
+### 3. Build & publish (push / manual dispatch only)
+- **`build`** — waits on all five jobs above. Sets up Buildx, builds the image tagged both `<sha>` and `latest`, scans the built image with Trivy (fails on CRITICAL/HIGH), saves it to `image.tar.gz`, and uploads it as a 1-day artifact along with the scan report.
+- **`publish`** — downloads the image artifact, loads it, assumes the AWS role via OIDC, logs in to ECR, and pushes both tags.
+
+### 4. Staging
+- **`deploy-staging`** — pulls the current ECS task definition, strips read-only fields with `jq`, renders a new revision pointing at the `<sha>` image, and deploys with `wait-for-service-stability: true`. On failure it prints the last 10 ECS service events.
+- **`staging-health-check`** and **`staging-smoke-test`** — run in parallel after deploy; both poll `http://<ALB_DNS_NAME>/` (30 attempts, 5s apart) to confirm the service is live.
+
+### 5. Production
+- **`deploy-production`** — gated on both staging checks passing and on the `production` environment. Same render-and-deploy flow as staging.
+- **`production-health-check`** and **`production-smoke-test`** — same checks against the production ALB.
+- **`post-deploy`** — a final request to `/` to confirm the service is still serving after the deploy settles.
+
+### 6. Failure handling
+- **`rollback`** — runs only when a production job fails. It finds the second-newest ACTIVE task definition in the family, points the ECS service at it with `--force-new-deployment`, and waits for stability. Note it has no environment gate, so it executes without approval.
+
+## How the stages connect
 
 ```
-security ─┐
-          ├─► build ─► deploy-staging ─► deploy-production ─► post-deploy
-test ─────┘                                        │
-                                                   └─► (manual dispatch) rollback
+validate ─┐
+test ─────┼─► build ─► publish ─► deploy-staging ─┬─► staging-health-check ─┐
+sec-dep ──┤                                       └─► staging-smoke-test ────┼─► deploy-production ─┬─► production-health-check ─┐
+sec-sec ──┤                                                                   │                      └─► production-smoke-test ───┼─► post-deploy
+sec-code ─┘                                                                   │                                                    │
+                                                                              └──────────────► rollback (on failure) ◄────────────┘
 ```
 
-### 1. Security Scans
-Runs on every push and PR. Three independent checks:
-- **Trivy** scans the filesystem for HIGH/CRITICAL vulnerabilities in dependencies — fails the job if found.
-- **gitleaks** scans the working tree for committed secrets (redacted output, fails on detection).
-- **CodeQL** performs static security analysis on JavaScript code; results are uploaded to the Security tab (`security-events: write`).
+Everything before `build` runs on pull requests; `build` and later only run on pushes to `main` or manual dispatch. All jobs have a 30-minute timeout.
 
-### 2. Unit and Integration Tests
-Sets up Node 20, installs dependencies with `npm ci` (deterministic, lockfile-based), and runs tests with coverage. Coverage reports plus any `reports/` and `dist/` output are uploaded as artifacts for inspection.
-
-### 3. Build, Scan and Push Image
-Only runs for pushes to `main` or manual dispatch (skipped on PRs). After security and tests pass:
-1. Assumes the AWS deploy role via OIDC and logs into ECR.
-2. Builds the Docker image (nginx:alpine base) using GitHub Actions cache (`type=gha`) for speed.
-3. Scans the built image with Trivy — HIGH/CRITICAL findings fail the pipeline before anything is pushed.
-4. Pushes the image tagged with the commit SHA and `latest`.
-
-### 4. Deploy to Staging
-Fetches the current ECS task definition, swaps in the new image (SHA tag), and deploys to the ECS service, waiting for stability. If deployment fails, it automatically rolls back to the previously running task definition and prints recent service events for debugging.
-
-### 5. Deploy to Production
-Identical deploy process, but gated by a **manual approval** step: a GitHub issue is created and a listed approver must approve before AWS credentials are even configured. Same rollback-on-failure behavior as staging.
-
-### 6. Post Deploy Verification
-Confirms the ECS service reaches a stable state and prints desired vs. running task counts as a final health check.
-
-### 7. Rollback (Manual)
-Triggered only via `workflow_dispatch`. Computes the previous task definition revision and forces the service back to it, waiting for stability. Fails safely if no earlier revision exists.
-
-## Key Design Points
-- **Concurrency**: One run per branch — new pushes cancel in-progress runs.
-- **OIDC auth**: No long-lived AWS keys; short-lived tokens via `id-token: write`.
-- **SHA-tagged images**: Every deploy is traceable to an exact commit.
-- **Defense in depth**: Dependency scan, secret scan, SAST, and image scan all gate the build.
-- **Local runs**: Steps guarded by `ACT != 'true'` are skipped when running with [act](https://github.com/nektos/act) locally.
-
-## Onboarding Tips
-- To trigger a full deploy without a code change, use **workflow_dispatch** on `main`.
-- If production deploy stalls, check the approval issue created by the `manual-approval` step.
-- If a deploy fails, check the printed ECS service events table in the failed job log before re-running.
+## Operational notes
+- The `test` job name mentions unit/integration/coverage, but only a container smoke test is executed — add real test steps if you need coverage reporting.
+- `ALB_DNS_NAME` is a single secret used by both staging and production checks. Scope it per environment (or use distinct secrets) so production verification cannot accidentally hit staging.
+- `concurrency` with `cancel-in-progress: true` will cancel a running pipeline when a newer commit lands on the same ref — including a production deploy.
+- Health checks use plain HTTP; consider HTTPS if the ALB terminates TLS.
+- The image travels between `build` and `publish` as a gzipped artifact with 1-day retention. For faster pipelines, push directly to ECR from `build` instead.
 
 ### Required GitHub Secrets
 
 Auto-provisioned by this pipeline:
+- [x] `ALB_DNS_NAME`
 - [x] `AWS_DEPLOY_ROLE_ARN`
 - [x] `AWS_REGION`
 - [x] `CONTAINER_NAME`
@@ -80,6 +96,3 @@ Auto-provisioned by this pipeline:
 - [x] `ECS_CLUSTER_NAME`
 - [x] `ECS_SERVICE_NAME`
 - [x] `ECS_TASK_FAMILY`
-
-Unresolved / failed to provision (add manually in GitHub before merging):
-- [ ] `PRODUCTION_APPROVERS`

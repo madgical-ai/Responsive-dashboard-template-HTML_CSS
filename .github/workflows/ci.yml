@@ -1,0 +1,486 @@
+name: CI/CD Pipeline
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+  workflow_dispatch: null
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  IMAGE_TAG: ${{ github.sha }}
+  AWS_REGION: us-east-1
+  HEALTHCHECK_PATH: /
+  HOST_PORT: '80'
+  CONTAINER_PORT: '80'
+jobs:
+  validate:
+    name: Validate (lint & type-check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Validate repository structure
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        set -euo pipefail
+        test -f Dockerfile || { echo "::error::Dockerfile not found"; exit 1; }
+        echo "Repository structure validated."
+    - name: Validate shell scripts
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        set -euo pipefail
+        found=0
+        while IFS= read -r -d '' script; do
+          found=1
+          bash -n "$script"
+          echo "Syntax OK: $script"
+        done < <(find . -type f -name '*.sh' -not -path './.git/*' -print0)
+        if [ "$found" -eq 0 ]; then
+          echo "No shell scripts found to validate."
+        fi
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.job }}-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  test:
+    name: Test (unit, integration, coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Build test image
+      run: docker build -t ci-test-image:${{ env.IMAGE_TAG }} .
+    - name: Run container smoke test
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        set -euo pipefail
+        docker run -d --name ci-test -p 8080:80 ci-test-image:${{ env.IMAGE_TAG }}
+        ok=0
+        for i in $(seq 1 30); do
+          if curl -fsS http://localhost:8080/ >/dev/null 2>&1; then
+            ok=1
+            break
+          fi
+          sleep 1
+        done
+        if [ "$ok" -ne 1 ]; then
+          echo "::error::Container did not become healthy"
+          docker logs ci-test || true
+          exit 1
+        fi
+        curl -fsS http://localhost:8080/ -o /dev/null
+        echo "Container smoke test passed" | tee test-report.txt
+    - name: Cleanup test container
+      if: always()
+      run: docker rm -f ci-test || true
+    - name: Upload test report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: unit-test-artifacts
+        path: test-report.txt
+        if-no-files-found: ignore
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.job }}-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  security-dependency-scan:
+    name: Security - Dependency Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Scan repository for dependency vulnerabilities
+      uses: aquasecurity/trivy-action@0.36.0
+      with:
+        scan-type: fs
+        scan-ref: .
+        format: table
+        severity: CRITICAL,HIGH
+        exit-code: '1'
+  security-secret-scan:
+    name: Security - Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Scan repository for committed secrets
+      uses: gitleaks/gitleaks-action@v1.1.0
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITLEAKS_ARGS: --verbose --redact
+  security-code-scan:
+    name: Security - Code Scan (CodeQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: javascript-typescript
+    - name: Perform CodeQL analysis
+      uses: github/codeql-action/analyze@v3
+  build:
+    name: Build & Scan Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - validate
+    - test
+    - security-dependency-scan
+    - security-secret-scan
+    - security-code-scan
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Build Docker image
+      run: |
+        set -euo pipefail
+        docker build \
+          -t "${{ secrets.ECR_REPOSITORY_URL }}:${{ env.IMAGE_TAG }}" \
+          -t "${{ secrets.ECR_REPOSITORY_URL }}:latest" .
+    - name: Scan Docker image for vulnerabilities
+      uses: aquasecurity/trivy-action@0.36.0
+      with:
+        scan-type: image
+        image-ref: ${{ secrets.ECR_REPOSITORY_URL }}:${{ env.IMAGE_TAG }}
+        format: table
+        severity: CRITICAL,HIGH
+        exit-code: '1'
+        output: trivy-image-results.txt
+    - name: Save image for publish
+      run: |
+        set -euo pipefail
+        docker save \
+          "${{ secrets.ECR_REPOSITORY_URL }}:${{ env.IMAGE_TAG }}" \
+          "${{ secrets.ECR_REPOSITORY_URL }}:latest" | gzip > image.tar.gz
+    - name: Upload image artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-image
+        path: image.tar.gz
+        retention-days: 1
+    - name: Upload image scan report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: trivy-image-results
+        path: trivy-image-results.txt
+        if-no-files-found: ignore
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.job }}-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  publish:
+    name: Publish Image to ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Download image artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: docker-image
+    - name: Load Docker image
+      run: docker load < image.tar.gz
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Log in to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
+    - name: Push Docker image to ECR
+      run: |
+        set -euo pipefail
+        docker push "${{ secrets.ECR_REPOSITORY_URL }}:${{ env.IMAGE_TAG }}"
+        docker push "${{ secrets.ECR_REPOSITORY_URL }}:latest"
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.job }}-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  deploy-staging:
+    name: Deploy to Staging (ECS Fargate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - publish
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Download current ECS task definition
+      run: |
+        set -euo pipefail
+        aws ecs describe-task-definition \
+          --task-definition "${{ secrets.ECS_TASK_FAMILY }}" \
+          --region "${{ env.AWS_REGION }}" \
+          --query taskDefinition | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' > task-definition.json
+    - name: Render new ECS task definition
+      id: render
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition.json
+        container-name: ${{ secrets.CONTAINER_NAME }}
+        image: ${{ secrets.ECR_REPOSITORY_URL }}:${{ env.IMAGE_TAG }}
+    - name: Deploy to ECS Fargate service
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.render.outputs.task-definition }}
+        service: ${{ secrets.ECS_SERVICE_NAME }}
+        cluster: ${{ secrets.ECS_CLUSTER_NAME }}
+        wait-for-service-stability: true
+    - name: Print ECS service events on failure
+      if: failure()
+      run: |
+        aws ecs describe-services \
+          --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
+          --services "${{ secrets.ECS_SERVICE_NAME }}" \
+          --region "${{ env.AWS_REGION }}" \
+          --query 'services[0].events[:10]' || true
+        exit 1
+  staging-health-check:
+    name: Staging Health Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - deploy-staging
+    environment: staging
+    steps:
+    - name: Check staging health endpoint
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        set -euo pipefail
+        for i in $(seq 1 30); do
+          if curl -fsS "http://${{ secrets.ALB_DNS_NAME }}${{ env.HEALTHCHECK_PATH }}"; then
+            echo "Staging health check passed"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "::error::Staging health check failed"
+        exit 1
+  staging-smoke-test:
+    name: Staging Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - deploy-staging
+    environment: staging
+    steps:
+    - name: Run staging smoke test
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        set -euo pipefail
+        curl -fsS "http://${{ secrets.ALB_DNS_NAME }}/" -o /dev/null
+        echo "Staging smoke test passed"
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.job }}-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  deploy-production:
+    name: Deploy to Production (ECS Fargate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - staging-health-check
+    - staging-smoke-test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Download current ECS task definition
+      run: |
+        set -euo pipefail
+        aws ecs describe-task-definition \
+          --task-definition "${{ secrets.ECS_TASK_FAMILY }}" \
+          --region "${{ env.AWS_REGION }}" \
+          --query taskDefinition | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' > task-definition.json
+    - name: Render new ECS task definition
+      id: render
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition.json
+        container-name: ${{ secrets.CONTAINER_NAME }}
+        image: ${{ secrets.ECR_REPOSITORY_URL }}:${{ env.IMAGE_TAG }}
+    - name: Deploy to ECS Fargate service
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.render.outputs.task-definition }}
+        service: ${{ secrets.ECS_SERVICE_NAME }}
+        cluster: ${{ secrets.ECS_CLUSTER_NAME }}
+        wait-for-service-stability: true
+    - name: Print ECS service events on failure
+      if: failure()
+      run: |
+        aws ecs describe-services \
+          --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
+          --services "${{ secrets.ECS_SERVICE_NAME }}" \
+          --region "${{ env.AWS_REGION }}" \
+          --query 'services[0].events[:10]' || true
+        exit 1
+  production-health-check:
+    name: Production Health Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - deploy-production
+    environment: production
+    steps:
+    - name: Check production health endpoint
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        set -euo pipefail
+        for i in $(seq 1 30); do
+          if curl -fsS "http://${{ secrets.ALB_DNS_NAME }}${{ env.HEALTHCHECK_PATH }}"; then
+            echo "Production health check passed"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "::error::Production health check failed"
+        exit 1
+  production-smoke-test:
+    name: Production Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - deploy-production
+    environment: production
+    steps:
+    - name: Run production smoke test
+      if: ${{ env.ACT != 'true' }}
+      run: |
+        set -euo pipefail
+        curl -fsS "http://${{ secrets.ALB_DNS_NAME }}/" -o /dev/null
+        echo "Production smoke test passed"
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.job }}-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  rollback:
+    name: Rollback ECS Service
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - deploy-production
+    - production-health-check
+    - production-smoke-test
+    if: failure()
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Roll back ECS service to previous task definition
+      run: |
+        set -euo pipefail
+        PREV=$(aws ecs list-task-definitions \
+          --family-prefix "${{ secrets.ECS_TASK_FAMILY }}" \
+          --status ACTIVE \
+          --sort DESC \
+          --query 'taskDefinitionArns[1]' \
+          --output text)
+        if [ -z "$PREV" ] || [ "$PREV" = "None" ]; then
+          echo "::error::No previous task definition revision found for rollback"
+          exit 1
+        fi
+        aws ecs update-service \
+          --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
+          --service "${{ secrets.ECS_SERVICE_NAME }}" \
+          --task-definition "$PREV" \
+          --force-new-deployment \
+          --region "${{ env.AWS_REGION }}"
+        aws ecs wait services-stable \
+          --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
+          --services "${{ secrets.ECS_SERVICE_NAME }}" \
+          --region "${{ env.AWS_REGION }}"
+  post-deploy:
+    name: Post Deploy Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - production-health-check
+    - production-smoke-test
+    environment: production
+    steps:
+    - name: Verify deployed service
+      if: ${{ env.ACT != 'true' }}
+      run: |-
+        set -euo pipefail
+        curl -fsS "http://${{ secrets.ALB_DNS_NAME }}/" -o /dev/null
+        echo "Post-deploy verification passed"
