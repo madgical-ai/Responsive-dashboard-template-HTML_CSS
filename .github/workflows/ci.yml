@@ -231,7 +231,7 @@ jobs:
           reports/**
           dist/**
         if-no-files-found: warn
- deploy:
+  deploy:
     name: Deploy to EC2 via SSM
     runs-on: ubuntu-latest
     timeout-minutes: 30
