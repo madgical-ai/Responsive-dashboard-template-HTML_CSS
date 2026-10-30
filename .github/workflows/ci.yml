@@ -268,7 +268,7 @@ jobs:
 
               "docker run -d --name \"$NEW\" " + ($img | @sh),
 
-              ("healthy=0; for i in $(seq 1 15); do if docker exec \"$NEW\" sh -c " + (("curl -fsS http://localhost:" + $container_port + "/ || wget -qO- http://localhost:" + $container_port + "/") | @sh) + " >/dev/null 2>&1; then healthy=1; break; fi; echo \"Waiting for application health check: $i/15\"; sleep 2; done; if [ \"$healthy\" -ne 1 ]; then echo Application health check failed; docker logs \"$NEW\" || true; docker rm -f \"$NEW\" || true; exit 1; fi"),
+              ("healthy=0; for i in $(seq 1 15); do if docker exec \"$NEW\" sh -c " + (("curl -fsS http://localhost:" + $container_port + "/health || wget -qO- http://localhost:" + $container_port + "/") | @sh) + " >/dev/null 2>&1; then healthy=1; break; fi; echo \"Waiting for application health check: $i/15\"; sleep 2; done; if [ \"$healthy\" -ne 1 ]; then echo Application health check failed; docker logs \"$NEW\" || true; docker rm -f \"$NEW\" || true; exit 1; fi"),
 
               "echo New container passed health check",
 
