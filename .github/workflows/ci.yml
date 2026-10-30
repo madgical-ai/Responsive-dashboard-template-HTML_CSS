@@ -373,6 +373,13 @@ jobs:
 
               docker rm -f {q(app_name)} >/dev/null 2>&1 || true""",
 
+              # Stop Nginx to free port 80 for Docker
+              f"""if command -v nginx >/dev/null 2>&1; then
+                  echo 'Stopping Nginx...'
+                  systemctl stop nginx || true
+                  systemctl disable nginx || true
+              fi""",
+
               # Check for non-Docker process using host port
               f"""if command -v ss >/dev/null 2>&1; then
                   if ss -ltn 'sport = :{host_port}' | grep -q LISTEN; then
