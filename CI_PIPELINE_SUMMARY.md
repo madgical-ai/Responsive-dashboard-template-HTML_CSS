@@ -1,85 +1,167 @@
-# CI/CD Pipeline Walkthrough
+# CI Pipeline Walkthrough
 
-This pipeline takes a commit from `main` through security scanning, testing, container build, and staged ECS deployment with manual production approval and rollback safety nets.
+A developer-facing guide to what this workflow does, why each stage exists, and what the project needs in place before CI can run.
+
+## Overview
+
+The workflow is defined in `.github/workflows/ci.yml` and has seven jobs. Three of them (`validate`, `test`, `security`) are quality gates that run on every pull request. The remaining four (`build`, `publish`, `deploy`, `health-check`) form a release chain that runs only when code lands on `main` or when someone triggers the workflow manually via `workflow_dispatch`.
+
+## Triggers and concurrency
+
+- **`pull_request` to `main`** — runs the three quality gates only.
+- **`push` to `main`** — runs the quality gates, then builds, publishes, deploys, and health-checks.
+- **`workflow_dispatch`** — same as a push, but started by hand.
+- **Concurrency** — the group is `workflow + ref` with `cancel-in-progress: true`, so a newer run on the same branch cancels the older one. This saves runner minutes but means a freshly queued push can abort a deploy that is mid-flight.
+- **Permissions** — the workflow defaults to read-only `contents`; individual jobs widen this only where needed (`packages: write` for publish, `id-token: write` for deploy's OIDC exchange).
+
+## Job-by-job
+
+### 1. `validate` — Lint and type check
+Runs on `ubuntu-latest` with a 30-minute timeout. After checking out the repo it inspects the project and runs only the tooling that applies:
+- If `package.json` exists: `npm ci` (when a lockfile is present) and `npm run lint`.
+- If `pyproject.toml` or `requirements.txt` exists: installs `ruff` and runs `ruff check .`.
+- If `tsconfig.json` exists: `npx tsc --noEmit`.
+- If `pyproject.toml` exists: installs `mypy` and runs `mypy .`.
+
+**Why:** catch style and type errors before they reach review, and keep the check language-agnostic so the same workflow fits either a Node or a Python service. The `env.ACT != 'true'` guards let developers run the file locally through `act` without invoking the real linters.
+
+### 2. `test` — Unit, integration, coverage
+Also `ubuntu-latest`. Runs `npm test` and/or `pytest -q` depending on what is detected, then integration tests and coverage collection (both currently placeholders that just echo). It uploads two artifacts:
+- `test-results` from `coverage/` and `test-results/`, always uploaded even if the job fails.
+- `test-artifacts` from `reports/` and `dist/`, uploaded with a warning if nothing matches.
+
+**Why:** produce machine-readable test output for reviewers and keep results available after a failed run.
+
+### 3. `security` — Secret, dependency, and code scanning
+Checks out with `fetch-depth: 0` so the full history is available for diff-aware scanning. Three steps:
+- **Gitleaks** — scans for committed secrets; uses `secrets.GITHUB_TOKEN`.
+- **Trivy filesystem scan** — reports CRITICAL/HIGH issues but is deliberately non-blocking (`exit-code: 0`).
+- **Static code scan** — currently a placeholder echo.
+
+**Why:** block leaked credentials and keep a visible record of dependency risk without hard-failing on findings that may not have a fix yet.
+
+### 4. `build` — Build and scan the image
+Gated on `needs: [validate, test, security]` and on the event being a push or manual dispatch. It:
+1. Sets up Docker Buildx.
+2. Lowercases the repository name into `ghcr.io/<owner>/<repo>` and exports it as `IMAGE_NAME`.
+3. Builds the image tagged with the commit SHA.
+4. Scans that image with Trivy (`exit-code: 1`, `ignore-unfixed: true`, `severity: CRITICAL,HIGH`) — this step **does** fail the pipeline.
+5. Writes the image reference to `image-metadata.txt` and uploads it as the `image-metadata` artifact.
+
+**Why:** verify the image is buildable and free of fixable high-severity CVEs before it is ever pushed to a registry.
+
+### 5. `publish` — Push to GHCR
+Gated on `needs: build` and a push/dispatch event. Requires `packages: write`. It logs in to `ghcr.io` with `github.repository_owner` and the built-in `GITHUB_TOKEN`, rebuilds the image, and pushes two tags: `:<commit-sha>` and `:latest`.
+
+**Why:** the deploy job pulls from the registry rather than shipping a tarball, so the exact SHA-tagged artifact that was scanned is the one that gets deployed.
+
+### 6. `deploy` — Deploy to EC2 via SSM
+Gated on `needs: publish`. Requires `id-token: write` so it can assume an AWS role through GitHub's OIDC provider — no long-lived AWS keys are stored in the repo. The job:
+1. Assumes `AWS_DEPLOY_ROLE_ARN` in `us-east-1`.
+2. Builds a JSON command document with `jq` and sends it to the target instance with `aws ssm send-command` using the `AWS-RunShellScript` document.
+3. Polls `get-command-invocation` every 10 seconds, up to 30 attempts, and exits non-zero on `Failed`, `Cancelled`, or `TimedOut`.
+
+The remote script performs a blue/green-style swap:
+- Installs Docker if missing (dnf, yum, or apt-get) and starts the daemon.
+- Logs in to the registry with `GHCR_USER` / `GHCR_TOKEN`.
+- Pulls the SHA-tagged image.
+- Starts it as `<DEPLOYMENT_NAME>-new` and waits for `GET /` on the container port to succeed.
+- Stops and removes the old container, then runs the new image as `<DEPLOYMENT_NAME>` with `-p 80:8080 --restart unless-stopped`.
+- Verifies `GET /` on the host port and prunes dangling images.
+
+**Why:** keep the old container serving traffic until the new one passes an in-container health check, so a bad release never takes the site down.
+
+### 7. `health-check` — Production verification
+Gated on `needs: deploy`. It retries `APP_URL/` twelve times with a five-second gap, then runs a smoke test against the same URL, and uploads a `health-check-artifacts` artifact.
+
+**Why:** confirm the deployment is reachable from the public internet, not just from inside the container.
+
+## How the stages connect
+
+```
+validate ─┐
+test ─────┼─> build ─> publish ─> deploy ─> health-check
+security ─┘
+```
+
+The three quality gates run in parallel and all must succeed before `build` starts. `publish` consumes the image reference produced by `build`. `deploy` consumes the pushed SHA tag. `health-check` is the final confirmation that the live URL responds. On pull requests the chain stops after `security`, which is why a PR can be green without ever exercising the Dockerfile.
 
 ## Prerequisites
 
-Before CI can run, the project and AWS environment must provide:
+### Runtime and versions
+- **Python 3.12** — the workflow sets `PYTHON_VERSION: '3.12'` and installs `ruff`, `mypy`, and `pytest` via pip. Note the env var is not wired into a `setup-python` step, so the runner's default Python is what actually executes; pin it explicitly if the project needs 3.12 specifically.
+- **Node.js and npm** — required only if the repository contains `package.json`. `npm ci` is used, so a `package-lock.json` must be committed for installs to run.
+- **`jq`** — used by the deploy job to build the SSM command payload. It is preinstalled on `ubuntu-latest`.
 
-- **Runtime**: Node.js 20 (installed via `actions/setup-node`); `npm ci` requires a committed `package-lock.json`.
-- **Docker base image**: `nginx:alpine` (from `Dockerfile`).
-- **System packages in image**: `curl` (installed in the Dockerfile).
-- **Exposed port**: `80` (container listens on 80; workflow maps `HOST_PORT=80` → `CONTAINER_PORT=80`).
-- **Entrypoint**: `nginx -g 'daemon off;'` serving static content from `/usr/share/nginx/html`.
-- **Runner**: `ubuntu-latest` with Docker/Buildx available.
-- **Required GitHub secrets**:
-  - `AWS_REGION` — AWS region for all operations
-  - `AWS_DEPLOY_ROLE_ARN` — IAM role assumed via OIDC (`id-token: write` permission)
-  - `ECR_REPOSITORY_URL` — target ECR repository
-  - `ECS_CLUSTER_NAME`, `ECS_SERVICE_NAME`, `ECS_TASK_FAMILY`, `CONTAINER_NAME` — ECS deployment targets
-  - `PRODUCTION_APPROVERS` — GitHub usernames allowed to approve production deploys
-- **AWS side**: An existing ECS cluster/service/task definition, an ECR repo, and an IAM deploy role trusting GitHub OIDC.
-- **Tools installed in-flight**: Trivy, gitleaks v8.18.4, `jq` (preinstalled on runners).
+### Docker
+- **Base image:** `nginxinc/nginx-unprivileged:alpine`. It runs as a non-root user, so the container cannot bind privileged ports internally.
+- **Exposed port:** `8080`. The image is started with `CMD ["nginx", "-g", "daemon off;"]`.
+- **Build context:** the repository root (the build command is `docker build .`).
+- **Build args:** none are declared or passed. If the Dockerfile gains build args, they must be added to both the `build` and `publish` jobs.
 
-## Pipeline Flow
+### System packages
+- On the GitHub runners: Docker, Buildx, `jq`, and `curl` come from the `ubuntu-latest` image.
+- On the EC2 host: Docker is installed by the deploy script itself (via `dnf`, `yum`, or `apt-get`) if it is not already present, and `curl` or `wget` is required for the in-container health checks.
 
-```
-security ─┐
-          ├─► build ─► deploy-staging ─► deploy-production ─► post-deploy
-test ─────┘                                        │
-                                                   └─► (manual dispatch) rollback
-```
+### Ports and networking
+- **EC2 host port `80`** (`HOST_PORT`) mapped to **container port `8080`** (`CONTAINER_PORT`).
+- The EC2 security group must allow inbound HTTP on port 80 from wherever `APP_URL` is reached.
+- The host must be able to reach `ghcr.io` to pull the image.
 
-### 1. Security Scans
-Runs on every push and PR. Three independent checks:
-- **Trivy** scans the filesystem for HIGH/CRITICAL vulnerabilities in dependencies — fails the job if found.
-- **gitleaks** scans the working tree for committed secrets (redacted output, fails on detection).
-- **CodeQL** performs static security analysis on JavaScript code; results are uploaded to the Security tab (`security-events: write`).
+### Required secrets and environment variables
 
-### 2. Unit and Integration Tests
-Sets up Node 20, installs dependencies with `npm ci` (deterministic, lockfile-based), and runs tests with coverage. Coverage reports plus any `reports/` and `dist/` output are uploaded as artifacts for inspection.
+| Name | Scope | Purpose |
+| --- | --- | --- |
+| `AWS_DEPLOY_ROLE_ARN` | secret | IAM role assumed via OIDC in the deploy job |
+| `EC2_INSTANCE_ID` | secret | Target instance for the SSM command |
+| `DEPLOYMENT_NAME` | secret | Container name and name prefix on the host |
+| `GHCR_TOKEN` | secret | Registry pull credential used on the EC2 host |
+| `GHCR_USER` | secret | Registry username (falls back to `github.actor`) |
+| `GITHUB_TOKEN` | auto | Used by Gitleaks and by the publish job's GHCR login |
+| `REGISTRY` | env | `ghcr.io` |
+| `IMAGE_TAG` | env | The commit SHA used as the image tag |
+| `IMAGE_NAME` | env | `ghcr.io/<owner>/<repo>` |
+| `AWS_REGION` | env | `us-east-1` |
+| `HOST_PORT` / `CONTAINER_PORT` | env | `80` and `8080` |
+| `APP_URL` | env | `http://3.89.79.100`, used by the final health check |
 
-### 3. Build, Scan and Push Image
-Only runs for pushes to `main` or manual dispatch (skipped on PRs). After security and tests pass:
-1. Assumes the AWS deploy role via OIDC and logs into ECR.
-2. Builds the Docker image (nginx:alpine base) using GitHub Actions cache (`type=gha`) for speed.
-3. Scans the built image with Trivy — HIGH/CRITICAL findings fail the pipeline before anything is pushed.
-4. Pushes the image tagged with the commit SHA and `latest`.
+### AWS prerequisites
+- An IAM OIDC identity provider for `token.actions.githubusercontent.com` and a role whose trust policy allows this repository.
+- The role needs `ssm:SendCommand` and `ssm:GetCommandInvocation` permissions for the target instance.
+- The EC2 instance must be registered with SSM (the SSM agent running) and have outbound access to the registry and to AWS endpoints.
 
-### 4. Deploy to Staging
-Fetches the current ECS task definition, swaps in the new image (SHA tag), and deploys to the ECS service, waiting for stability. If deployment fails, it automatically rolls back to the previously running task definition and prints recent service events for debugging.
+### Build args
+None. There are no `ARG` values passed at build time.
 
-### 5. Deploy to Production
-Identical deploy process, but gated by a **manual approval** step: a GitHub issue is created and a listed approver must approve before AWS credentials are even configured. Same rollback-on-failure behavior as staging.
+## Known gaps and risks
 
-### 6. Post Deploy Verification
-Confirms the ECS service reaches a stable state and prints desired vs. running task counts as a final health check.
+- **PRs skip the image build.** A broken Dockerfile only fails after merge to `main`, in the `build` job.
+- **Filesystem Trivy scan is advisory.** `exit-code: 0` means dependency findings never block a PR; only the image scan in `build` can fail the pipeline.
+- **`GHCR_TOKEN` fallback is unsafe.** If `GHCR_TOKEN` is unset, the remote script uses `GITHUB_TOKEN`, which is scoped to the workflow run and will not authenticate a registry pull on EC2.
+- **No rollback.** The old container is removed after the new one passes its check, but if the swap or host-port check fails there is no automatic restore, and a leftover `<DEPLOYMENT_NAME>-new` container can remain.
+- **Hardcoded production URL.** `APP_URL` points at a fixed IP; it will need updating if the instance is replaced.
+- **Placeholder steps.** The integration tests, coverage collection, static code scan, and several artifact uploads currently only echo or match nothing, so a green run does not yet mean those checks executed.
+- **Container environment.** The deploy step runs the image with no `-e` flags, so any configuration the app needs must be baked into the image.
 
-### 7. Rollback (Manual)
-Triggered only via `workflow_dispatch`. Computes the previous task definition revision and forces the service back to it, waiting for stability. Fails safely if no earlier revision exists.
+## Troubleshooting quick reference
 
-## Key Design Points
-- **Concurrency**: One run per branch — new pushes cancel in-progress runs.
-- **OIDC auth**: No long-lived AWS keys; short-lived tokens via `id-token: write`.
-- **SHA-tagged images**: Every deploy is traceable to an exact commit.
-- **Defense in depth**: Dependency scan, secret scan, SAST, and image scan all gate the build.
-- **Local runs**: Steps guarded by `ACT != 'true'` are skipped when running with [act](https://github.com/nektos/act) locally.
-
-## Onboarding Tips
-- To trigger a full deploy without a code change, use **workflow_dispatch** on `main`.
-- If production deploy stalls, check the approval issue created by the `manual-approval` step.
-- If a deploy fails, check the printed ECS service events table in the failed job log before re-running.
+| Symptom | Where to look |
+| --- | --- |
+| Lint or type errors | `validate` job logs |
+| Test failures or missing artifacts | `test` job logs and the `test-results` artifact |
+| Secret detected | `security` job, Gitleaks output |
+| Image fails to build | `build` job, Docker build step |
+| CVE blocks the pipeline | `build` job, Trivy image scan step |
+| Push rejected | `publish` job, GHCR login step and `packages: write` permission |
+| Deploy hangs or fails | `deploy` job, `ssm-output.json` status and `StandardErrorContent` |
+| Site unreachable after deploy | `health-check` job and the EC2 security group |
 
 ### Required GitHub Secrets
 
 Auto-provisioned by this pipeline:
 - [x] `AWS_DEPLOY_ROLE_ARN`
 - [x] `AWS_REGION`
-- [x] `CONTAINER_NAME`
-- [x] `ECR_REPOSITORY_URL`
-- [x] `ECS_CLUSTER_NAME`
-- [x] `ECS_SERVICE_NAME`
-- [x] `ECS_TASK_FAMILY`
-
-Unresolved / failed to provision (add manually in GitHub before merging):
-- [ ] `PRODUCTION_APPROVERS`
+- [x] `DEPLOYMENT_NAME`
+- [x] `EC2_INSTANCE_ID`
+- [x] `GHCR_TOKEN`
+- [x] `GHCR_USER`
