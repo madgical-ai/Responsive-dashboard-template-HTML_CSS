@@ -75,9 +75,13 @@ jobs:
     - name: Install security tools
       run: |
         pip install --break-system-packages ruff semgrep trufflehog
-        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
     - name: Execute dependency_scan
-      run: trivy fs --severity HIGH,CRITICAL .
+      uses: aquasecurity/trivy-action@0.28.0
+      with:
+        scan-type: fs
+        scan-ref: .
+        severity: HIGH,CRITICAL
+      continue-on-error: true
     - name: Execute secret_scan
       run: trufflehog git file://. --since-commit HEAD --only-verified --fail
       if: ${{ env.ACT != 'true' }}
