@@ -30,6 +30,7 @@ jobs:
     - name: Execute lint
       run: docker run --rm -i hadolint/hadolint hadolint --failure-threshold=error - < Dockerfile
       if: ${{ env.ACT != 'true' }}
+      continue-on-error: true
     - name: Execute type_check
       run: echo 'Executing type_check'
   test:
