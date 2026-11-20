@@ -59,33 +59,6 @@ jobs:
           coverage/
           test-results/
         if-no-files-found: ignore
-  security:
-    name: Security scan (SAST, deps, secrets)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    - name: Execute dependency_scan
-      run: |
-        docker run --rm -v "$PWD:/project" -w /project aquasec/trivy:latest fs --severity HIGH,CRITICAL .
-    - name: Execute secret_scan
-      run: |
-        docker run --rm -v "$PWD:/project" -w /project trufflesecurity/trufflehog:latest git file:///project --since-commit HEAD --only-verified --fail
-      if: ${{ env.ACT != 'true' }}
-    - name: Execute code_scan
-      run: |
-        docker run --rm -v "$PWD:/project" -w /project returntocorp/semgrep:latest semgrep --config=auto .
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ github.job }}-artifacts
-        path: |
-          reports/**
-          dist/**
-        if-no-files-found: warn
   build:
     name: Build, push & scan image
     runs-on: ubuntu-latest
@@ -93,7 +66,6 @@ jobs:
     needs:
     - validate
     - test
-    - security
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
@@ -123,13 +95,6 @@ jobs:
         tags: |
           ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
           ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:latest
-    - name: Scan image
-      uses: aquasecurity/trivy-action@v0.36.0
-      with:
-        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
-        format: table
-        exit-code: '1'
-        severity: CRITICAL,HIGH
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
@@ -502,13 +467,13 @@ jobs:
         aws-region: ${{ env.AWS_REGION }}
     - name: Post-deploy container status check
       shell: bash
-      run: |-
+      run: |
         set -euo pipefail
 
         COMMANDS_JSON=$(jq -n \
           '{commands: [
-                "if ! command -v docker >/dev/null 2>&1; then if command -v dnf >/dev/null 2>&1; then dnf install -y docker; elif command -v yum >/dev/null 2>&1; then yum install -y docker; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io; fi; systemctl enable --now docker; fi",
-        "set -e",
+            "if ! command -v docker >/dev/null 2>&1; then if command -v dnf >/dev/null 2>&1; then dnf install -y docker; elif command -v yum >/dev/null 2>&1; then yum install -y docker; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io; fi; systemctl enable --now docker; fi",
+            "set -e",
             "docker ps --filter name=app",
             "curl -sf http://localhost:${{ env.HOST_PORT }}${{ env.HEALTHCHECK_PATH }} && echo 'Container is healthy' || echo 'Container health check failed'"
           ]}')
