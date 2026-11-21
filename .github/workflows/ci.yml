@@ -6,6 +6,7 @@ on:
   pull_request:
     branches:
     - main
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
@@ -28,7 +29,7 @@ jobs:
       uses: actions/checkout@v4
     - name: Execute lint
       run: docker run --rm -i hadolint/hadolint < Dockerfile
-      if: ${{ env.ACT != 'true' }}
+      if: github.actor != 'nektos/act'
     - name: Execute type_check
       run: echo 'Executing type_check'
   test:
@@ -49,7 +50,7 @@ jobs:
       run: echo 'Executing integration_test'
     - name: Execute coverage
       run: echo 'Executing coverage'
-      if: ${{ env.ACT != 'true' }}
+      if: github.actor != 'nektos/act'
     - name: Upload test artifacts
       uses: actions/upload-artifact@v4
       if: always()
@@ -72,7 +73,7 @@ jobs:
     - name: Execute secret_scan
       run: |
         docker run --rm -v "$PWD":/repo trufflesecurity/trufflehog:latest git file:///repo --since-commit HEAD --only-verified --fail
-      if: ${{ env.ACT != 'true' }}
+      if: github.actor != 'nektos/act'
     - name: Execute code_scan
       run: |
         docker run --rm -v "$PWD":/src semgrep/semgrep:latest semgrep --config=auto /src
@@ -106,8 +107,7 @@ jobs:
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
         echo "IMAGE_REPO=$IMAGE_REPO" >> "$GITHUB_ENV"
     - name: Build Docker image
-      run: docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG
-        }} .
+      run: docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }} .
     - name: Scan image for vulnerabilities
       uses: aquasecurity/trivy-action@v0.36.0
       with:
@@ -161,8 +161,8 @@ jobs:
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
         IMAGE="${{ env.REGISTRY }}/${IMAGE_REPO}:${{ env.IMAGE_TAG }}"
 
-        HOST_PORT="${{ env.HOST_PORT || '80' }}"
-        CONTAINER_PORT="${{ env.CONTAINER_PORT || '80' }}"
+        HOST_PORT="${{ env.HOST_PORT }}"
+        CONTAINER_PORT="${{ env.CONTAINER_PORT }}"
         host_port="$HOST_PORT"
         container_port="$CONTAINER_PORT"
 
@@ -278,8 +278,8 @@ jobs:
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
         IMAGE="${{ env.REGISTRY }}/${IMAGE_REPO}:${{ env.IMAGE_TAG }}"
 
-        HOST_PORT="${{ env.HOST_PORT || '80' }}"
-        CONTAINER_PORT="${{ env.CONTAINER_PORT || '80' }}"
+        HOST_PORT="${{ env.HOST_PORT }}"
+        CONTAINER_PORT="${{ env.CONTAINER_PORT }}"
         host_port="$HOST_PORT"
         container_port="$CONTAINER_PORT"
 
@@ -398,8 +398,8 @@ jobs:
         IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
         IMAGE="${{ env.REGISTRY }}/${IMAGE_REPO}:${PREV_SHA}"
 
-        HOST_PORT="${{ env.HOST_PORT || '80' }}"
-        CONTAINER_PORT="${{ env.CONTAINER_PORT || '80' }}"
+        HOST_PORT="${{ env.HOST_PORT }}"
+        CONTAINER_PORT="${{ env.CONTAINER_PORT }}"
         host_port="$HOST_PORT"
         container_port="$CONTAINER_PORT"
 
@@ -531,4 +531,4 @@ jobs:
 
         echo "Post-deploy status check timed out"
         exit 1
-      if: ${{ env.ACT != 'true' }}
+      if: github.actor != 'nektos/act'
