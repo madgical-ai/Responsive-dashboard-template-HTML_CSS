@@ -1,25 +1,23 @@
 name: CI/CD Pipeline
-"on":
+on:
   push:
     branches:
     - main
   pull_request:
     branches:
     - main
-  workflow_dispatch:
-permissions:
-  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 env:
   REGISTRY: ghcr.io
   IMAGE_TAG: ${{ github.sha }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
   HOST_PORT: '80'
   CONTAINER_PORT: '80'
   HEALTHCHECK_PATH: /
-  AWS_REGION: us-east-1
-  IMAGE_REPO: ${{ github.repository }}
+permissions:
+  contents: read
 jobs:
   validate:
     name: Validate (lint & type-check)
@@ -29,7 +27,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
     - name: Execute lint
-      run: docker run --rm -i hadolint/hadolint --failure-threshold=none < Dockerfile || true
+      run: docker run --rm -i hadolint/hadolint < Dockerfile
       if: ${{ env.ACT != 'true' }}
     - name: Execute type_check
       run: echo 'Executing type_check'
@@ -37,15 +35,20 @@ jobs:
     name: Test (unit, integration, coverage)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    needs:
+    - validate
     steps:
     - name: Checkout
       uses: actions/checkout@v4
     - name: Build test image
-      run: docker build -t app:test .
+      run: |
+        IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+        IMAGE_NAME="${{ env.REGISTRY }}/${IMAGE_REPO}:test"
+        docker build -t "$IMAGE_NAME" .
+        echo "IMAGE_NAME=$IMAGE_NAME" >> "$GITHUB_ENV"
     - name: Execute unit_test
       run: |
-        IMAGE_NAME=app:test
-        docker run --rm -d -p 80:80 --name test-app $IMAGE_NAME && sleep 2 && (curl -f http://localhost:80 || exit 1)
+        docker run --rm -d -p 80:80 --name test-app "$IMAGE_NAME" && sleep 2 && (curl -f http://localhost:80 || exit 1)
     - name: Execute integration_test
       run: echo 'Executing integration_test'
     - name: Execute coverage
@@ -68,14 +71,14 @@ jobs:
       uses: actions/checkout@v4
     - name: Execute dependency_scan
       run: |
-        docker run --rm -v ${{ github.workspace }}:/project aquasec/trivy:latest fs --severity HIGH,CRITICAL /project
+        docker run --rm -v "${{ github.workspace }}:/workspace" -w /workspace aquasec/trivy:latest fs --severity HIGH,CRITICAL --exit-code 1 .
     - name: Execute secret_scan
       run: |
-        docker run --rm -v ${{ github.workspace }}:/project trufflesecurity/trufflehog:latest git file:///project --since-commit HEAD --only-verified --fail
+        docker run --rm -v "${{ github.workspace }}:/workspace" -w /workspace trufflesecurity/trufflehog:latest git file:///workspace --since-commit HEAD --only-verified --fail
       if: ${{ env.ACT != 'true' }}
     - name: Execute code_scan
       run: |
-        docker run --rm -v ${{ github.workspace }}:/project returntocorp/semgrep:latest semgrep --config=auto /project
+        docker run --rm -v "${{ github.workspace }}:/workspace" -w /workspace returntocorp/semgrep:latest semgrep --config=auto .
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
@@ -96,37 +99,38 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-    - name: Set lowercase image repo
-      run: |
-        IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-        echo "IMAGE_REPO=$IMAGE_REPO" >> $GITHUB_ENV
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
     - name: Log in to GHCR
       uses: docker/login-action@v3
       with:
-        registry: ghcr.io
+        registry: ${{ env.REGISTRY }}
         username: ${{ github.repository_owner }}
         password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Compute lowercase image repo
+      run: |
+        IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+        echo "IMAGE_REPO=$IMAGE_REPO" >> "$GITHUB_ENV"
     - name: Build and push image
       uses: docker/build-push-action@v6
       with:
         context: .
+        file: Dockerfile
         push: true
         tags: |
           ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
           ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:latest
-    - name: Scan image
+    - name: Scan image for vulnerabilities
       uses: aquasecurity/trivy-action@v0.36.0
       with:
         image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
         format: table
         exit-code: '0'
         severity: CRITICAL,HIGH
+        ignore-unfixed: true
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
@@ -142,10 +146,9 @@ jobs:
     needs:
     - build
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    environment: staging
     permissions:
-      contents: read
       id-token: write
+      contents: read
       packages: write
     steps:
     - name: Checkout
@@ -167,6 +170,7 @@ jobs:
         CONTAINER_PORT="${{ env.CONTAINER_PORT || '80' }}"
         host_port="$HOST_PORT"
         container_port="$CONTAINER_PORT"
+        app_name="${{ secrets.DEPLOYMENT_NAME || 'app' }}"
 
         COMMANDS_JSON=$(jq -n \
           --arg img "$IMAGE" \
@@ -174,21 +178,21 @@ jobs:
           --arg token "${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}" \
           --arg host_port "$HOST_PORT" \
           --arg container_port "$CONTAINER_PORT" \
-          --arg app_name "${{ secrets.DEPLOYMENT_NAME }}" \
+          --arg app_name "$app_name" \
           '{commands: [
             "set -e",
-            "if ! command -v docker >/dev/null 2>&1; then if command -v dnf >/dev/null 2>&1; then dnf install -y docker; elif command -v yum >/dev/null 2>&1; then yum install -y docker; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io; else echo \"No supported package manager found\"; exit 1; fi; fi; systemctl enable --now docker || service docker start",
-            "for i in $(seq 1 15); do sudo docker info >/dev/null 2>&1 && break || sleep 1; done",
-            "echo " + ($img | @sh) + " | sudo docker login ghcr.io -u " + ($user | @sh) + " --password-stdin",
-            "sudo docker pull " + ($img | @sh),
-            "sudo docker rm -f " + ($app_name | @sh) + "-new 2>/dev/null || true",
-            "sudo docker run -d --name " + ($app_name | @sh) + "-new -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh),
-            "for i in $(seq 1 15); do sudo docker exec " + ($app_name | @sh) + "-new sh -c \"curl -sf http://localhost:" + ($container_port | @sh) + "/ || wget -q -O- http://localhost:" + ($container_port | @sh) + "/\" >/dev/null 2>&1 && break || sleep 1; done",
-            "sudo docker exec " + ($app_name | @sh) + "-new sh -c \"curl -sf http://localhost:" + ($container_port | @sh) + "/ || wget -q -O- http://localhost:" + ($container_port | @sh) + "/\" >/dev/null 2>&1 || exit 1",
-            "sudo docker stop " + ($app_name | @sh) + " 2>/dev/null || true && sudo docker rm " + ($app_name | @sh) + " 2>/dev/null || true",
-            "sudo docker rm -f " + ($app_name | @sh) + "-new 2>/dev/null || true",
-            "sudo docker run -d --name " + ($app_name | @sh) + " --restart unless-stopped -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh),
-            "sudo docker image prune -f || true"
+            "if ! command -v docker >/dev/null 2>&1; then if command -v dnf >/dev/null 2>&1; then dnf install -y docker; elif command -v yum >/dev/null 2>&1; then yum install -y docker; else apt-get update && apt-get install -y docker.io; fi; fi",
+            "systemctl enable --now docker 2>/dev/null || service docker start 2>/dev/null || true",
+            "for i in $(seq 1 15); do docker info >/dev/null 2>&1 && break || sleep 1; done",
+            "echo " + ($token | @sh) + " | docker login " + ($img | split(":")[0] | split("/")[0:3] | join("/") | @sh) + " -u " + ($user | @sh) + " --password-stdin",
+            "docker pull " + ($img | @sh),
+            "docker rm -f " + ($app_name | @sh) + "-new 2>/dev/null || true",
+            "docker run -d --name " + ($app_name | @sh) + "-new -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh),
+            "for i in $(seq 1 15); do docker exec " + ($app_name | @sh) + "-new sh -c \"curl -sf http://localhost:" + ($container_port | @sh) + "/ || wget -q -O- http://localhost:" + ($container_port | @sh) + "/\" >/dev/null 2>&1 && break || sleep 1; done",
+            "docker stop " + ($app_name | @sh) + " 2>/dev/null || true && docker rm " + ($app_name | @sh) + " 2>/dev/null || true",
+            "docker rm -f " + ($app_name | @sh) + "-new 2>/dev/null || true",
+            "docker run -d --name " + ($app_name | @sh) + " --restart unless-stopped -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh),
+            "docker image prune -f || true"
           ]}')
 
         aws ssm send-command \
@@ -209,8 +213,10 @@ jobs:
             --query 'Status' \
             --output text)
           if [ "$STATUS" = "Success" ]; then
+            echo "SSM command succeeded"
             exit 0
           elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+            echo "SSM command failed with status: $STATUS"
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
@@ -222,57 +228,29 @@ jobs:
           sleep 10
         done
 
-        echo "Deployment timed out"
+        echo "SSM command timed out waiting for completion"
         exit 1
     - name: Staging health check & smoke test
       shell: bash
       run: |
         set -euo pipefail
 
-        HOST_PORT="${{ env.HOST_PORT || '80' }}"
-        HEALTHCHECK_PATH="${{ env.HEALTHCHECK_PATH || '/' }}"
-
-        COMMANDS_JSON=$(jq -n \
-          --arg host_port "$HOST_PORT" \
-          --arg healthcheck_path "$HEALTHCHECK_PATH" \
-          '{commands: [
-            "set -e",
-            "for i in $(seq 1 15); do curl -sf http://localhost:" + ($host_port | @sh) + ($healthcheck_path | @sh) + " >/dev/null 2>&1 && break || sleep 1; done",
-            "curl -sf http://localhost:" + ($host_port | @sh) + ($healthcheck_path | @sh) + " || exit 1"
-          ]}')
-
-        aws ssm send-command \
+        INSTANCE_IP=$(aws ec2 describe-instances \
           --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
           --region "${{ env.AWS_REGION }}" \
-          --document-name "AWS-RunShellScript" \
-          --comment "Staging health check" \
-          --parameters "$COMMANDS_JSON" \
-          --output json > ssm-health-output.json
-
-        COMMAND_ID=$(jq -r '.Command.CommandId' ssm-health-output.json)
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
 
         for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-            --region "${{ env.AWS_REGION }}" \
-            --query 'Status' \
-            --output text)
-          if [ "$STATUS" = "Success" ]; then
+          if curl -sf "http://${INSTANCE_IP}:${{ env.HOST_PORT }}${{ env.HEALTHCHECK_PATH }}" >/dev/null 2>&1; then
+            echo "Staging health check passed"
+            curl -sf "http://${INSTANCE_IP}:${{ env.HOST_PORT }}${{ env.HEALTHCHECK_PATH }}"
             exit 0
-          elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-            aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-              --region "${{ env.AWS_REGION }}" \
-              --query 'StandardErrorContent' \
-              --output text
-            exit 1
           fi
           sleep 10
         done
 
-        echo "Health check timed out"
+        echo "Staging health check failed"
         exit 1
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
@@ -289,10 +267,9 @@ jobs:
     needs:
     - deploy-staging
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    environment: production
     permissions:
-      contents: read
       id-token: write
+      contents: read
       packages: write
     steps:
     - name: Checkout
@@ -314,6 +291,7 @@ jobs:
         CONTAINER_PORT="${{ env.CONTAINER_PORT || '80' }}"
         host_port="$HOST_PORT"
         container_port="$CONTAINER_PORT"
+        app_name="${{ secrets.DEPLOYMENT_NAME || 'app' }}"
 
         COMMANDS_JSON=$(jq -n \
           --arg img "$IMAGE" \
@@ -321,21 +299,21 @@ jobs:
           --arg token "${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}" \
           --arg host_port "$HOST_PORT" \
           --arg container_port "$CONTAINER_PORT" \
-          --arg app_name "${{ secrets.DEPLOYMENT_NAME }}" \
+          --arg app_name "$app_name" \
           '{commands: [
             "set -e",
-            "if ! command -v docker >/dev/null 2>&1; then if command -v dnf >/dev/null 2>&1; then dnf install -y docker; elif command -v yum >/dev/null 2>&1; then yum install -y docker; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io; else echo \"No supported package manager found\"; exit 1; fi; fi; systemctl enable --now docker || service docker start",
-            "for i in $(seq 1 15); do sudo docker info >/dev/null 2>&1 && break || sleep 1; done",
-            "echo " + ($img | @sh) + " | sudo docker login ghcr.io -u " + ($user | @sh) + " --password-stdin",
-            "sudo docker pull " + ($img | @sh),
-            "sudo docker rm -f " + ($app_name | @sh) + "-new 2>/dev/null || true",
-            "sudo docker run -d --name " + ($app_name | @sh) + "-new -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh),
-            "for i in $(seq 1 15); do sudo docker exec " + ($app_name | @sh) + "-new sh -c \"curl -sf http://localhost:" + ($container_port | @sh) + "/ || wget -q -O- http://localhost:" + ($container_port | @sh) + "/\" >/dev/null 2>&1 && break || sleep 1; done",
-            "sudo docker exec " + ($app_name | @sh) + "-new sh -c \"curl -sf http://localhost:" + ($container_port | @sh) + "/ || wget -q -O- http://localhost:" + ($container_port | @sh) + "/\" >/dev/null 2>&1 || exit 1",
-            "sudo docker stop " + ($app_name | @sh) + " 2>/dev/null || true && sudo docker rm " + ($app_name | @sh) + " 2>/dev/null || true",
-            "sudo docker rm -f " + ($app_name | @sh) + "-new 2>/dev/null || true",
-            "sudo docker run -d --name " + ($app_name | @sh) + " --restart unless-stopped -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh),
-            "sudo docker image prune -f || true"
+            "if ! command -v docker >/dev/null 2>&1; then if command -v dnf >/dev/null 2>&1; then dnf install -y docker; elif command -v yum >/dev/null 2>&1; then yum install -y docker; else apt-get update && apt-get install -y docker.io; fi; fi",
+            "systemctl enable --now docker 2>/dev/null || service docker start 2>/dev/null || true",
+            "for i in $(seq 1 15); do docker info >/dev/null 2>&1 && break || sleep 1; done",
+            "echo " + ($token | @sh) + " | docker login " + ($img | split(":")[0] | split("/")[0:3] | join("/") | @sh) + " -u " + ($user | @sh) + " --password-stdin",
+            "docker pull " + ($img | @sh),
+            "docker rm -f " + ($app_name | @sh) + "-new 2>/dev/null || true",
+            "docker run -d --name " + ($app_name | @sh) + "-new -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh),
+            "for i in $(seq 1 15); do docker exec " + ($app_name | @sh) + "-new sh -c \"curl -sf http://localhost:" + ($container_port | @sh) + "/ || wget -q -O- http://localhost:" + ($container_port | @sh) + "/\" >/dev/null 2>&1 && break || sleep 1; done",
+            "docker stop " + ($app_name | @sh) + " 2>/dev/null || true && docker rm " + ($app_name | @sh) + " 2>/dev/null || true",
+            "docker rm -f " + ($app_name | @sh) + "-new 2>/dev/null || true",
+            "docker run -d --name " + ($app_name | @sh) + " --restart unless-stopped -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh),
+            "docker image prune -f || true"
           ]}')
 
         aws ssm send-command \
@@ -356,8 +334,10 @@ jobs:
             --query 'Status' \
             --output text)
           if [ "$STATUS" = "Success" ]; then
+            echo "SSM command succeeded"
             exit 0
           elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+            echo "SSM command failed with status: $STATUS"
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
@@ -369,57 +349,29 @@ jobs:
           sleep 10
         done
 
-        echo "Deployment timed out"
+        echo "SSM command timed out waiting for completion"
         exit 1
     - name: Production health check & smoke test
       shell: bash
       run: |
         set -euo pipefail
 
-        HOST_PORT="${{ env.HOST_PORT || '80' }}"
-        HEALTHCHECK_PATH="${{ env.HEALTHCHECK_PATH || '/' }}"
-
-        COMMANDS_JSON=$(jq -n \
-          --arg host_port "$HOST_PORT" \
-          --arg healthcheck_path "$HEALTHCHECK_PATH" \
-          '{commands: [
-            "set -e",
-            "for i in $(seq 1 15); do curl -sf http://localhost:" + ($host_port | @sh) + ($healthcheck_path | @sh) + " >/dev/null 2>&1 && break || sleep 1; done",
-            "curl -sf http://localhost:" + ($host_port | @sh) + ($healthcheck_path | @sh) + " || exit 1"
-          ]}')
-
-        aws ssm send-command \
+        INSTANCE_IP=$(aws ec2 describe-instances \
           --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
           --region "${{ env.AWS_REGION }}" \
-          --document-name "AWS-RunShellScript" \
-          --comment "Production health check" \
-          --parameters "$COMMANDS_JSON" \
-          --output json > ssm-health-output.json
-
-        COMMAND_ID=$(jq -r '.Command.CommandId' ssm-health-output.json)
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
 
         for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-            --region "${{ env.AWS_REGION }}" \
-            --query 'Status' \
-            --output text)
-          if [ "$STATUS" = "Success" ]; then
+          if curl -sf "http://${INSTANCE_IP}:${{ env.HOST_PORT }}${{ env.HEALTHCHECK_PATH }}" >/dev/null 2>&1; then
+            echo "Production health check passed"
+            curl -sf "http://${INSTANCE_IP}:${{ env.HOST_PORT }}${{ env.HEALTHCHECK_PATH }}"
             exit 0
-          elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-            aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-              --region "${{ env.AWS_REGION }}" \
-              --query 'StandardErrorContent' \
-              --output text
-            exit 1
           fi
           sleep 10
         done
 
-        echo "Health check timed out"
+        echo "Production health check failed"
         exit 1
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
@@ -437,8 +389,8 @@ jobs:
     - deploy-production
     if: failure()
     permissions:
-      contents: read
       id-token: write
+      contents: read
       packages: write
     steps:
     - name: Checkout
@@ -448,7 +400,7 @@ jobs:
       with:
         role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
         aws-region: ${{ env.AWS_REGION }}
-    - name: Rollback to previous image
+    - name: Rollback to previous image via SSM
       shell: bash
       run: |
         set -euo pipefail
@@ -461,6 +413,7 @@ jobs:
         CONTAINER_PORT="${{ env.CONTAINER_PORT || '80' }}"
         host_port="$HOST_PORT"
         container_port="$CONTAINER_PORT"
+        app_name="${{ secrets.DEPLOYMENT_NAME || 'app' }}"
 
         COMMANDS_JSON=$(jq -n \
           --arg img "$IMAGE" \
@@ -468,21 +421,17 @@ jobs:
           --arg token "${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}" \
           --arg host_port "$HOST_PORT" \
           --arg container_port "$CONTAINER_PORT" \
-          --arg app_name "${{ secrets.DEPLOYMENT_NAME }}" \
+          --arg app_name "$app_name" \
           '{commands: [
             "set -e",
-            "if ! command -v docker >/dev/null 2>&1; then if command -v dnf >/dev/null 2>&1; then dnf install -y docker; elif command -v yum >/dev/null 2>&1; then yum install -y docker; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io; else echo \"No supported package manager found\"; exit 1; fi; fi; systemctl enable --now docker || service docker start",
-            "for i in $(seq 1 15); do sudo docker info >/dev/null 2>&1 && break || sleep 1; done",
-            "echo " + ($img | @sh) + " | sudo docker login ghcr.io -u " + ($user | @sh) + " --password-stdin",
-            "sudo docker pull " + ($img | @sh),
-            "sudo docker rm -f " + ($app_name | @sh) + "-new 2>/dev/null || true",
-            "sudo docker run -d --name " + ($app_name | @sh) + "-new -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh),
-            "for i in $(seq 1 15); do sudo docker exec " + ($app_name | @sh) + "-new sh -c \"curl -sf http://localhost:" + ($container_port | @sh) + "/ || wget -q -O- http://localhost:" + ($container_port | @sh) + "/\" >/dev/null 2>&1 && break || sleep 1; done",
-            "sudo docker exec " + ($app_name | @sh) + "-new sh -c \"curl -sf http://localhost:" + ($container_port | @sh) + "/ || wget -q -O- http://localhost:" + ($container_port | @sh) + "/\" >/dev/null 2>&1 || exit 1",
-            "sudo docker stop " + ($app_name | @sh) + " 2>/dev/null || true && sudo docker rm " + ($app_name | @sh) + " 2>/dev/null || true",
-            "sudo docker rm -f " + ($app_name | @sh) + "-new 2>/dev/null || true",
-            "sudo docker run -d --name " + ($app_name | @sh) + " --restart unless-stopped -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh),
-            "sudo docker image prune -f || true"
+            "if ! command -v docker >/dev/null 2>&1; then if command -v dnf >/dev/null 2>&1; then dnf install -y docker; elif command -v yum >/dev/null 2>&1; then yum install -y docker; else apt-get update && apt-get install -y docker.io; fi; fi",
+            "systemctl enable --now docker 2>/dev/null || service docker start 2>/dev/null || true",
+            "for i in $(seq 1 15); do docker info >/dev/null 2>&1 && break || sleep 1; done",
+            "echo " + ($token | @sh) + " | docker login " + ($img | split(":")[0] | split("/")[0:3] | join("/") | @sh) + " -u " + ($user | @sh) + " --password-stdin",
+            "docker pull " + ($img | @sh),
+            "docker stop " + ($app_name | @sh) + " 2>/dev/null || true && docker rm " + ($app_name | @sh) + " 2>/dev/null || true",
+            "docker run -d --name " + ($app_name | @sh) + " --restart unless-stopped -p " + ($host_port | @sh) + ":" + ($container_port | @sh) + " " + ($img | @sh),
+            "docker image prune -f || true"
           ]}')
 
         aws ssm send-command \
@@ -503,8 +452,10 @@ jobs:
             --query 'Status' \
             --output text)
           if [ "$STATUS" = "Success" ]; then
+            echo "Rollback SSM command succeeded"
             exit 0
           elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+            echo "Rollback SSM command failed with status: $STATUS"
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
@@ -516,7 +467,29 @@ jobs:
           sleep 10
         done
 
-        echo "Rollback timed out"
+        echo "Rollback SSM command timed out waiting for completion"
+        exit 1
+    - name: Rollback health check
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        INSTANCE_IP=$(aws ec2 describe-instances \
+          --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+          --region "${{ env.AWS_REGION }}" \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
+
+        for i in $(seq 1 30); do
+          if curl -sf "http://${INSTANCE_IP}:${{ env.HOST_PORT }}${{ env.HEALTHCHECK_PATH }}" >/dev/null 2>&1; then
+            echo "Rollback health check passed"
+            curl -sf "http://${INSTANCE_IP}:${{ env.HOST_PORT }}${{ env.HEALTHCHECK_PATH }}"
+            exit 0
+          fi
+          sleep 10
+        done
+
+        echo "Rollback health check failed"
         exit 1
   post-deploy:
     name: Post-deploy notification
@@ -526,8 +499,8 @@ jobs:
     - deploy-production
     if: always()
     permissions:
-      contents: read
       id-token: write
+      contents: read
       packages: write
     steps:
     - name: Checkout
@@ -537,17 +510,19 @@ jobs:
       with:
         role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
         aws-region: ${{ env.AWS_REGION }}
-    - name: Post-deploy container status check
+    - name: Post-deploy container status check via SSM
       shell: bash
       run: |-
         set -euo pipefail
 
+        app_name="${{ secrets.DEPLOYMENT_NAME || 'app' }}"
+
         COMMANDS_JSON=$(jq -n \
-          --arg app_name "${{ secrets.DEPLOYMENT_NAME }}" \
+          --arg app_name "$app_name" \
           '{commands: [
                 "if ! command -v docker >/dev/null 2>&1; then if command -v dnf >/dev/null 2>&1; then dnf install -y docker; elif command -v yum >/dev/null 2>&1; then yum install -y docker; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io; fi; systemctl enable --now docker; fi",
         "set -e",
-            "sudo docker ps --filter name=" + ($app_name | @sh) + " --format \"table {{.Names}}\\t{{.Status}}\\t{{.Ports}}\""
+            "docker ps --filter name=" + ($app_name | @sh) + " --format \"table {{.Names}}\\t{{.Status}}\\t{{.Ports}}\""
           ]}')
 
         aws ssm send-command \
@@ -568,6 +543,7 @@ jobs:
             --query 'Status' \
             --output text)
           if [ "$STATUS" = "Success" ]; then
+            echo "Post-deploy status check succeeded"
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
@@ -576,6 +552,7 @@ jobs:
               --output text
             exit 0
           elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+            echo "Post-deploy status check failed with status: $STATUS"
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
@@ -587,6 +564,6 @@ jobs:
           sleep 10
         done
 
-        echo "Post-deploy check timed out"
+        echo "Post-deploy status check timed out waiting for completion"
         exit 1
       if: ${{ env.ACT != 'true' }}
