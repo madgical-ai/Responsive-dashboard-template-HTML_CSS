@@ -155,6 +155,16 @@ jobs:
       with:
         role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
         aws-region: ${{ env.AWS_REGION }}
+    - name: Validate EC2 instance ID
+      shell: bash
+      run: |
+        set -euo pipefail
+        INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+        if [ -z "$INSTANCE_ID" ]; then
+          echo "Error: EC2_INSTANCE_ID secret is empty. Please set it in repository secrets."
+          exit 1
+        fi
+        echo "Using EC2 instance: $INSTANCE_ID"
     - name: Deploy to staging via SSM
       shell: bash
       run: |
@@ -302,6 +312,16 @@ jobs:
       with:
         role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
         aws-region: ${{ env.AWS_REGION }}
+    - name: Validate EC2 instance ID
+      shell: bash
+      run: |
+        set -euo pipefail
+        INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+        if [ -z "$INSTANCE_ID" ]; then
+          echo "Error: EC2_INSTANCE_ID secret is empty. Please set it in repository secrets."
+          exit 1
+        fi
+        echo "Using EC2 instance: $INSTANCE_ID"
     - name: Deploy to production via SSM
       shell: bash
       run: |
@@ -448,6 +468,16 @@ jobs:
       with:
         role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
         aws-region: ${{ env.AWS_REGION }}
+    - name: Validate EC2 instance ID
+      shell: bash
+      run: |
+        set -euo pipefail
+        INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+        if [ -z "$INSTANCE_ID" ]; then
+          echo "Error: EC2_INSTANCE_ID secret is empty. Please set it in repository secrets."
+          exit 1
+        fi
+        echo "Using EC2 instance: $INSTANCE_ID"
     - name: Rollback to previous image
       shell: bash
       run: |
@@ -537,6 +567,16 @@ jobs:
       with:
         role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
         aws-region: ${{ env.AWS_REGION }}
+    - name: Validate EC2 instance ID
+      shell: bash
+      run: |
+        set -euo pipefail
+        INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+        if [ -z "$INSTANCE_ID" ]; then
+          echo "Error: EC2_INSTANCE_ID secret is empty. Please set it in repository secrets."
+          exit 1
+        fi
+        echo "Using EC2 instance: $INSTANCE_ID"
     - name: Post-deploy container status check
       shell: bash
       run: |-
